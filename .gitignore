@@ -1,0 +1,27 @@
+# 编译产物（用户自行 go build，不入库）
+*.exe
+*.exe~
+*.test
+*.out
+
+# 逆向脚本的临时导出物（可用 tools/reverse/cdp_scripts2.py 重建，约 48MB）
+tools/reverse/js_src/
+tools/reverse/ctx/
+
+# 本地 Python 虚拟环境（按需重建，见 tools/reverse/README.md）
+.venv-cdp/
+
+# 助手工作区 / 本地笔记
+.workbuddy/
+
+# 本地配置与凭据（切勿提交）
+.cookies
+*.cookies
+.env
+.mcp.json
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
