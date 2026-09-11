@@ -282,11 +282,12 @@ OrcaTerm 没登录或登录过期了。打开 OrcaTerm 重新登录一下，代�
 ## 目录结构
 
 ```
-OrcaTermProxy/
+OrcaBridge/
 ├── README.md                    ← 你正在读的这个
+├── LICENSE                      ← MIT
 ├── main.go / content.go / session.go   ← 主程序
 ├── clean_test.go                ← 单元测试
-├── orcabridge.exe           ← 编译产物
+├── orcabridge.exe               ← 编译产物（已 gitignore，各人自己编译）
 ├── docs/
 │   └── OrcaTerm AI 代理工具分析报告.md  ← 协议逆向细节，想深入了解看这个
 └── tools/reverse/               ← 逆向与探测脚本（附 README）
