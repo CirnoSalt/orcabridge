@@ -65,12 +65,21 @@ Chromium / WebView2 系一般是启动时加 `--remote-debugging-port=9333`。
 |---|---|
 | `proxy_tools_e2e.py` | **tools 回归测试**。改完代码跑这个，一条命令确认 tools 还正常 |
 | `proxy_models_e2e.py` | **模型功能回归测试**。覆盖列表 / 单模型 / 切换生效 / 别名 / 未知模型 404 / tools 回归 |
+| `proxy_content_e2e.py` | **内容与 agent 任务回归**。Markdown / 代码围栏 / `<think>` / 业务关键词保真，多轮上下文，终端工具链闭环，流式协议与 tool delta 形状，`/debug/last` |
+
+诊断类：
+
+| 脚本 | 作用 |
+|---|---|
+| `raw_dump.py` | **直连上游 dump 原始响应字节**。代理报解析失败时先跑它，别靠猜。`--tools` 模拟带工具服务的请求 |
+| `cookie_probe.py` | 诊断登录态：`.cookies` 与 WebView cookie DB 里的 `ot_session` 到期时间。报 `upstream_auth_error` 时先跑它 |
 
 ```powershell
 # 先起代理，再跑回归
 $env:PROXY_PORT=8083; .\orcabridge.exe
 .\.venv-cdp\Scripts\python.exe tools\reverse\proxy_tools_e2e.py 8083
 .\.venv-cdp\Scripts\python.exe tools\reverse\proxy_models_e2e.py 8083
+.\.venv-cdp\Scripts\python.exe tools\reverse\proxy_content_e2e.py 8083
 ```
 
 `proxy_tools_e2e.py` 依次验证：触发 `tool_calls` → 回传结果被模型消费 → 孤儿结果被正确拒绝
@@ -78,6 +87,15 @@ $env:PROXY_PORT=8083; .\orcabridge.exe
 
 `proxy_models_e2e.py` 会断言"不同模型给出不同回答"，用来确认模型切换真的生效
 （只看 HTTP 200 是不够的，上游对未知模型也会返回 200 + 空内容）。
+
+`proxy_content_e2e.py` 覆盖清洗管线保真与 agent 任务闭环。**它会区分"失败"与"模型行为"**：
+上游经常返回 `action=ask` 反问，或泄漏自己的 JSON 输出约束后拒绝任务，这些只记 `[INFO]`
+（正文本身没被清洗），不算失败；只有请求非 200、或模型确实给了代码围栏而内容被改写时才算失败。
+注意它依赖 `X-OrcaTerm-Action` 响应头判断动作。
+
+脚本里的响应头查找必须**大小写无关**：Go 会把 `X-OrcaTerm-*` 规范化成线上形式
+`X-Orcaterm-*`，用 `dict(response.headers).get("X-OrcaTerm-Session")` 会永远取不到值。
+`proxy_tools_e2e.py` 里的 `HeaderBag` 就是为此存在的。
 
 ---
 

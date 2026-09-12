@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -318,6 +320,7 @@ type chatEnvelope struct {
 	Thinking       string        `json:"thinking"`
 	TaskCompletion string        `json:"taskCompletion"`
 	Question       string        `json:"question"`
+	Options        []string      `json:"options"`
 	Tool           *UpstreamTool `json:"tool"`
 }
 
@@ -378,14 +381,18 @@ func ToolCallsFromUpstream(t *UpstreamTool) []ToolCall {
 	return []ToolCall{tc}
 }
 
-// ParseChatEnvelope 从 raw-stream 聚合文本中解析 ```json {…} ``` 包络。
+// ParseChatEnvelope 从 raw-stream 聚合文本中解析严格可信的 OrcaTerm 动作包络。
+// 只有 completion / ask / review 且字段形态符合协议时才接受，普通 fenced JSON 不会被误判。
 func ParseChatEnvelope(text string) (*chatEnvelope, bool) {
-	for _, cand := range fenceCandidates(text) {
+	for _, cand := range envelopeCandidates(text) {
 		var env chatEnvelope
-		if err := json.Unmarshal([]byte(cand), &env); err != nil {
+		dec := json.NewDecoder(strings.NewReader(cand))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&env); err != nil || !validChatEnvelope(&env) {
 			continue
 		}
-		if env.Action == "" {
+		var extra interface{}
+		if err := dec.Decode(&extra); err == nil {
 			continue
 		}
 		return &env, true
@@ -393,42 +400,91 @@ func ParseChatEnvelope(text string) (*chatEnvelope, bool) {
 	return nil, false
 }
 
-// ParseReviewEnvelope 只在包络是工具调用（action=review + tool.name 非空）时返回。
+func validChatEnvelope(env *chatEnvelope) bool {
+	if env == nil {
+		return false
+	}
+	switch env.Action {
+	case "completion":
+		return env.TaskCompletion != "" && env.Question == "" && env.Tool == nil
+	case "ask":
+		return env.Question != "" && env.TaskCompletion == "" && env.Tool == nil
+	case "review":
+		return env.Tool != nil && strings.TrimSpace(env.Tool.Name) != "" && env.TaskCompletion == "" && env.Question == ""
+	default:
+		return false
+	}
+}
+
+// ParseReviewEnvelope 只在包络是工具调用（action=review + 合法 tool）时返回。
 func ParseReviewEnvelope(text string) (*UpstreamTool, bool) {
 	env, ok := ParseChatEnvelope(text)
-	if !ok || env.Action != "review" || env.Tool == nil || strings.TrimSpace(env.Tool.Name) == "" {
+	if !ok || env.Action != "review" {
 		return nil, false
 	}
 	return env.Tool, true
 }
 
-// fenceCandidates 截出所有 ```json … ``` 块，以及末尾平衡的 JSON 对象，供解析尝试。
-// 上游流式输出可能被截断（围栏未闭合），因此额外用括号配平兜底。
-func fenceCandidates(s string) []string {
+// envelopeCandidates 只枚举 json 围栏及纯 JSON 文本，避免扫描普通 Markdown 代码围栏。
+// 未闭合 json 围栏仅在其中已经包含完整、平衡的 JSON 对象时才作为候选。
+func envelopeCandidates(s string) []string {
 	var out []string
-	rest := s
-	for {
-		i := strings.Index(rest, "```")
+	for offset := 0; offset < len(s); {
+		i, prefixLen := nextJSONFence(s, offset)
 		if i < 0 {
 			break
 		}
-		tail := rest[i+3:]
-		if j := strings.Index(tail, "```"); j >= 0 {
-			if b := trimToBalancedObject(tail[:j]); b != "" {
+		bodyStart := i + prefixLen
+		if end := strings.Index(s[bodyStart:], "```"); end >= 0 {
+			if b := trimToBalancedObject(s[bodyStart : bodyStart+end]); b != "" {
 				out = append(out, b)
 			}
-			rest = tail[j+3:]
+			offset = bodyStart + end + 3
 			continue
 		}
-		if b := trimToBalancedObject(tail); b != "" {
+		if b := trimToBalancedObject(s[bodyStart:]); b != "" {
 			out = append(out, b)
 		}
 		break
 	}
-	if b := trimToBalancedObject(s); b != "" {
-		out = append(out, b)
+	trimmed := strings.TrimSpace(s)
+	if strings.HasPrefix(trimmed, "{") {
+		if b := trimToBalancedObject(trimmed); b != "" && strings.TrimSpace(b) == trimmed {
+			out = append(out, b)
+		}
 	}
 	return out
+}
+
+func nextJSONFence(s string, from int) (int, int) {
+	for from < len(s) {
+		rel := strings.Index(s[from:], "```")
+		if rel < 0 {
+			return -1, 0
+		}
+		i := from + rel
+		j := i + 3
+		for j < len(s) && (s[j] == ' ' || s[j] == '\t') {
+			j++
+		}
+		if len(s)-j >= 4 && strings.EqualFold(s[j:j+4], "json") {
+			k := j + 4
+			if k == len(s) || s[k] == '\r' || s[k] == '\n' || s[k] == ' ' || s[k] == '\t' {
+				for k < len(s) && (s[k] == ' ' || s[k] == '\t') {
+					k++
+				}
+				if k < len(s) && s[k] == '\r' {
+					k++
+				}
+				if k < len(s) && s[k] == '\n' {
+					k++
+				}
+				return i, k - i
+			}
+		}
+		from = i + 3
+	}
+	return -1, 0
 }
 
 // trimToBalancedObject 从首个 '{' 起截到与之配平的 '}'（忽略字符串内的括号）。
@@ -470,9 +526,17 @@ func trimToBalancedObject(s string) string {
 
 // ToolResultMessage 调用方回传的一条工具结果。
 type ToolResultMessage struct {
-	Name    string
-	Content string
+	ToolCallID string
+	Name       string
+	Content    string
+	Legacy     bool
 }
+
+// 工具结果解析中的可识别错误，供 handler 映射成稳定的错误码。
+var (
+	errToolResultMissingID = errors.New("tool result is missing tool_call_id")
+	errMultipleToolResults = errors.New("multiple tool results are unsupported")
+)
 
 // InputPlan 本轮发往上游的输入方案。
 type InputPlan struct {
@@ -487,13 +551,17 @@ type InputPlan struct {
 // OpenAI 约定：工具结果以 role="tool" 的消息紧跟在触发它的 assistant tool_calls 之后。
 // 命中时不再走普通问答路径，而是按真机格式回传结果并续跑同一上游会话。
 func extractInputPlan(msgs []ChatMessage, multiTurn bool) (*InputPlan, error) {
-	if results, ok := trailingToolResults(msgs); ok {
-		parts := make([]string, 0, len(results))
-		for _, r := range results {
-			parts = append(parts, BuildToolResultPrompt(r.Name, r.Content))
+	results, isResult, err := trailingToolResults(msgs)
+	if err != nil {
+		return nil, err
+	}
+	if isResult {
+		if len(results) != 1 {
+			return nil, errMultipleToolResults
 		}
+		r := results[0]
 		return &InputPlan{
-			Text:         strings.Join(parts, "\n\n"),
+			Text:         BuildToolResultPrompt(r.Name, r.Content),
 			IsToolResult: true,
 			Results:      results,
 		}, nil
@@ -505,46 +573,53 @@ func extractInputPlan(msgs []ChatMessage, multiTurn bool) (*InputPlan, error) {
 	return &InputPlan{Text: text, Images: images}, nil
 }
 
-// trailingToolResults 取末尾连续的 role="tool" 消息（可能有多个）。
-// 第二个返回值为 false 表示本轮不是工具结果回传。
-func trailingToolResults(msgs []ChatMessage) ([]ToolResultMessage, bool) {
+// trailingToolResults 严格解析末尾工具结果。现代 role=tool 必须携带 tool_call_id；
+// legacy role=function 可携带 name，但只能由 handler 在有会话键时解析。
+// 只允许一个工具结果：上游一次只维护一个待处理调用。
+func trailingToolResults(msgs []ChatMessage) ([]ToolResultMessage, bool, error) {
 	var out []ToolResultMessage
 	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role != "tool" {
+		m := msgs[i]
+		if m.Role != "tool" && m.Role != "function" {
 			break
 		}
-		text, _, err := ParseContent(msgs[i].Content)
+		text, _, err := ParseContent(m.Content)
 		if err != nil {
-			text = ""
+			return nil, true, fmt.Errorf("parse tool result content: %w", err)
+		}
+		id := strings.TrimSpace(m.ToolCallID)
+		legacy := m.Role == "function"
+		if !legacy && id == "" {
+			return nil, true, errToolResultMissingID
+		}
+		name := strings.TrimSpace(m.Name)
+		if name == "" && id != "" {
+			name = toolNameOf(msgs, i)
 		}
 		out = append([]ToolResultMessage{{
-			Name:    toolNameOf(msgs, i),
-			Content: text,
+			ToolCallID: id,
+			Name:       name,
+			Content:    text,
+			Legacy:     legacy,
 		}}, out...)
 	}
-	if len(out) == 0 {
-		return nil, false
-	}
-	return out, true
+	return out, len(out) > 0, nil
 }
 
 // toolNameOf 找出触发第 idx 条工具结果的工具名（用于生成拒绝文本的 tool 字段）。
 func toolNameOf(msgs []ChatMessage, idx int) string {
-	if n := strings.TrimSpace(msgs[idx].Name); n != "" {
-		return n
-	}
 	id := strings.TrimSpace(msgs[idx].ToolCallID)
+	if id == "" {
+		return ""
+	}
 	for i := idx - 1; i >= 0; i-- {
 		if msgs[i].Role != "assistant" {
 			continue
 		}
 		for _, tc := range msgs[i].ToolCalls {
-			if id == "" || tc.ID == id {
+			if tc.ID == id {
 				return tc.Function.Name
 			}
-		}
-		if len(msgs[i].ToolCalls) > 0 {
-			return msgs[i].ToolCalls[0].Function.Name
 		}
 		break
 	}
@@ -604,41 +679,88 @@ func ToolsInstruction(tools []Tool) string {
 	return sb.String()
 }
 
-// ExtractToolCalls 从模型输出中尝试解析 tool_calls，返回调用列表与剥离后的正文。
+// ExtractToolCalls 从模型输出中解析专用的 ```tool_calls 围栏。
+// 只有成功解析的专用围栏会从正文剥离，普通 Markdown/JSON 围栏一律保留。
 func ExtractToolCalls(text string) ([]ToolCall, string) {
-	cleaned := stripFencedJSON(text)
-	candidates := []string{cleaned}
-	// 也尝试从首个 '{' 起解析
-	if i := strings.Index(cleaned, "{"); i >= 0 {
-		candidates = append(candidates, cleaned[i:])
+	body, start, end, ok := dedicatedToolCallsFence(text)
+	if ok {
+		if calls, ok := parseToolCallsPayload(body); ok {
+			return calls, strings.TrimSpace(text[:start] + text[end:])
+		}
 	}
-	for _, c := range candidates {
-		var payload struct {
-			ToolCalls []struct {
-				Name      string                 `json:"name"`
-				Arguments map[string]interface{} `json:"arguments"`
-			} `json:"tool_calls"`
-		}
-		if err := json.Unmarshal([]byte(strings.TrimSpace(c)), &payload); err != nil {
-			continue
-		}
-		if len(payload.ToolCalls) == 0 {
-			continue
-		}
-		out := make([]ToolCall, 0, len(payload.ToolCalls))
-		for _, c2 := range payload.ToolCalls {
-			var tc ToolCall
-			tc.ID = "call_" + newUUID()
-			tc.Type = "function"
-			tc.Function.Name = c2.Name
-			if b, err := json.Marshal(c2.Arguments); err == nil {
-				tc.Function.Arguments = string(b)
-			} else {
-				tc.Function.Arguments = "{}"
-			}
-			out = append(out, tc)
-		}
-		return out, strings.TrimSpace(cleaned)
+	// 兼容旧调用方：整段输出本身就是 tool_calls JSON 时仍可解析。
+	if calls, ok := parseToolCallsPayload(strings.TrimSpace(text)); ok {
+		return calls, ""
 	}
-	return nil, cleaned
+	return nil, text
+}
+
+func dedicatedToolCallsFence(text string) (body string, start, end int, ok bool) {
+	for offset := 0; offset < len(text); {
+		rel := strings.Index(text[offset:], "```")
+		if rel < 0 {
+			return "", 0, 0, false
+		}
+		start = offset + rel
+		lineEnd := strings.IndexByte(text[start+3:], '\n')
+		if lineEnd < 0 {
+			return "", 0, 0, false
+		}
+		lineEnd += start + 3
+		info := strings.TrimSpace(strings.TrimSuffix(text[start+3:lineEnd], "\r"))
+		bodyStart := lineEnd + 1
+		closeRel := strings.Index(text[bodyStart:], "```")
+		if closeRel < 0 {
+			return "", 0, 0, false
+		}
+		close := bodyStart + closeRel
+		end = close + 3
+		if info == "tool_calls" || info == "tool_calls json" || info == "json tool_calls" {
+			return text[bodyStart:close], start, end, true
+		}
+		offset = end
+	}
+	return "", 0, 0, false
+}
+
+func parseToolCallsPayload(raw string) ([]ToolCall, bool) {
+	var payload struct {
+		ToolCalls []struct {
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		} `json:"tool_calls"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &payload); err != nil || len(payload.ToolCalls) == 0 {
+		return nil, false
+	}
+	out := make([]ToolCall, 0, len(payload.ToolCalls))
+	for _, call := range payload.ToolCalls {
+		if strings.TrimSpace(call.Name) == "" || !validToolArguments(call.Arguments) {
+			return nil, false
+		}
+		args := strings.TrimSpace(string(call.Arguments))
+		if args == "" || args == "null" {
+			args = "{}"
+		}
+		var tc ToolCall
+		tc.ID = "call_" + newUUID()
+		tc.Type = "function"
+		tc.Function.Name = call.Name
+		tc.Function.Arguments = args
+		out = append(out, tc)
+	}
+	return out, true
+}
+
+// validToolArguments 要求工具参数为空/null 或 JSON 对象，拒绝字符串、数组及损坏 JSON。
+func validToolArguments(args json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(args))
+	if trimmed == "" || trimmed == "null" {
+		return true
+	}
+	if !json.Valid(args) || !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	var obj map[string]json.RawMessage
+	return json.Unmarshal(args, &obj) == nil
 }
