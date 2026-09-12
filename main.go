@@ -101,7 +101,7 @@ func loadConfig() Config {
 		HideTools:     true,
 		SessionTTL:    30 * time.Minute,
 		SessionMax:    1000,
-		ToolsMode:     "native",
+		ToolsMode:     toolsModePass,
 		ContextLimit:  128000,
 	}
 	if v := os.Getenv("PROXY_PORT"); v != "" {
@@ -227,8 +227,9 @@ func validateConfig(c Config) error {
 	if c.Mode != "structured" && c.Mode != "raw-stream" {
 		return fmt.Errorf("ORCATERM_MODE must be structured or raw-stream, got %q", c.Mode)
 	}
-	if c.ToolsMode != "native" && c.ToolsMode != "error" && c.ToolsMode != "inject" && c.ToolsMode != "ignore" {
-		return fmt.Errorf("ORCATERM_TOOLS_MODE must be native, error, inject, or ignore, got %q", c.ToolsMode)
+	if c.ToolsMode != toolsModePass && c.ToolsMode != toolsModeNative &&
+		c.ToolsMode != "error" && c.ToolsMode != "inject" && c.ToolsMode != "ignore" {
+		return fmt.Errorf("ORCATERM_TOOLS_MODE must be pass, native, error, inject, or ignore, got %q", c.ToolsMode)
 	}
 	if c.OnDegraded != "empty" && c.OnDegraded != "raw" && c.OnDegraded != "error" {
 		return fmt.Errorf("ORCATERM_ON_DEGRADED must be empty, raw, or error, got %q", c.OnDegraded)
@@ -556,17 +557,19 @@ func validateUpstreamTool(tool *UpstreamTool) error {
 // ===== 请求体结构 =====
 
 type ChatCompletionRequest struct {
-	Model             string          `json:"model"`
-	Messages          []ChatMessage   `json:"messages"`
-	Stream            bool            `json:"stream"`
-	StreamOptions     StreamOptions   `json:"stream_options"`
-	User              string          `json:"user"`
-	SessionID         string          `json:"session_id"`
-	Tools             []Tool          `json:"tools"`
-	Functions         []ToolFunction  `json:"functions"`
-	ToolChoice        json.RawMessage `json:"tool_choice"`
-	FunctionCall      json.RawMessage `json:"function_call"`
-	ParallelToolCalls *bool           `json:"parallel_tool_calls"`
+	Model         string          `json:"model"`
+	Messages      []ChatMessage   `json:"messages"`
+	Stream        bool            `json:"stream"`
+	StreamOptions StreamOptions   `json:"stream_options"`
+	User          string          `json:"user"`
+	SessionID     string          `json:"session_id"`
+	Tools         []Tool          `json:"tools"`
+	Functions     []ToolFunction  `json:"functions"`
+	ToolChoice    json.RawMessage `json:"tool_choice"`
+	FunctionCall  json.RawMessage `json:"function_call"`
+	// ParallelToolCalls 接受 true/false：上游一次只产出一个调用，而"只返回一个调用"
+	// 本身就是 parallel_tool_calls=true 的合法响应，因此不再拒绝该字段。
+	ParallelToolCalls *bool `json:"parallel_tool_calls"`
 }
 
 type StreamOptions struct {
@@ -1080,6 +1083,25 @@ func (ps *ProxyServer) handleModelByID(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(modelEntry(m, created, m.ID == ps.defaultModel().ID))
 }
 
+// tools 处理模式。
+//
+//   - pass（默认）：接受调用方声明的**任意**工具名。只有声明里含 OrcaTerm 原生工具时
+//     才向上游启用原生工具服务；外来名字（agent 客户端自己的 Agent/Bash/Read 等）
+//     记进 Unsupported 并通过响应头与日志暴露，不会静默消失。
+//   - native：严格模式。表外名字直接 400，适合想靠代理校验工具名拼写的场景。
+//   - ignore：忽略 tools 声明（不校验、也不启用原生工具服务）。
+//   - error：只要声明了 tools 就 400。
+//   - inject：legacy 提示词注入模拟，不可靠。
+//
+// 为什么默认是 pass：默认曾是 native，但真实的 agent 客户端（ZCode / Cline / Roo 等）
+// 都会声明自己的一套工具，严格模式让它们**每次请求都 400**，代理等于不可用。
+// 上游本来也不会执行这些自定义 function，接受声明是安全的；关键是**不静默**——
+// 外来名字必须通过响应头与日志让调用方看得见。
+const (
+	toolsModePass   = "pass"
+	toolsModeNative = "native"
+)
+
 // toolPolicy 是调用方 tools/functions 声明经过校验后的规范化结果。
 type toolPolicy struct {
 	Tools   []Tool
@@ -1087,17 +1109,22 @@ type toolPolicy struct {
 	Choice  string // auto / none
 	Enabled bool   // 是否向上游启用原生工具服务
 	Mode    string // 生效的 ORCATERM_TOOLS_MODE
+	// Unsupported 是调用方声明了、但 OrcaTerm 上游没有的工具名（保序去重）。
+	Unsupported []string
 }
 
-// nativeToolNames 是 OrcaTerm 客户端实际注册的原生工具名。
+// nativeToolNames 是可声明的 OrcaTerm 原生工具名。
 //
-// 取自客户端前端 bundle 的 V8 code cache 字符串表（EBWebView/Default/Code Cache/js），
-// 并用真机请求逐项验证：只声明 execute_terminal_command 时，上游会先请求
-// list_terminals，导致 "upstream requested undeclared tool" —— 说明终端类任务是
-// 一条工具链，客户端必须能一次性声明整条链路。
+// 来源与维护：上游真正的工具表由**服务端**下发，客户端 bundle 里只留名字字符串。
+// 因此这里是"客户端 Code Cache 扫描 + 真机观察"的快照，不是权威全量。
+// 刷新方式：`tools/reverse/native_tools_scan.py`（`--go` 可直接产出下面的条目）。
+// 真机实测被上游实际请求过的关键项：fetch、list_terminals、select_connect_config、
+// execute_terminal_command —— **终端类任务是一条工具链**，只声明其中一环会在中途
+// 撞上 "upstream requested undeclared tool"，所以要把可能用到的整条链路都声明。
 //
-// 这些名字只用于**校验调用方的 tools 声明**：自定义 function 无法在上游注册，
-// 所以声明表外的名字一律拒绝。上游真正调用什么由服务端系统提示词决定。
+// 这些名字只用于**校验调用方的 tools 声明**：自定义 function 无法在上游注册。
+// pass 模式下表外名字不算错误，只会记进 Unsupported 并通过响应头暴露；
+// native 模式下才直接 400。
 var nativeToolNames = map[string]bool{
 	// 网页抓取
 	"fetch": true,
@@ -1105,10 +1132,18 @@ var nativeToolNames = map[string]bool{
 	"list_terminals":           true,
 	"get_terminal_detail":      true,
 	"get_terminal_output":      true,
+	"get_active_terminal":      true,
 	"execute_terminal_command": true,
 	"send_terminal_signal":     true,
-	"list_connect_configs":     true,
 	"get_command_history":      true,
+	// 连接配置与隧道
+	"list_connect_configs":       true,
+	"select_connect_config":      true,
+	"connect_by_history_session": true,
+	"connect_share":              true,
+	"connect_share_visit":        true,
+	"get_confirmed_session":      true,
+	"close_tunnel":               true,
 	// 命令与后台任务
 	"execute_command":          true,
 	"create_command":           true,
@@ -1121,12 +1156,31 @@ var nativeToolNames = map[string]bool{
 	"read_cloud_space_file":      true,
 	"read_cloud_space_file_list": true,
 	"create_cloud_space_file":    true,
+	"create_file":                true,
+	"create_directory":           true,
+	"delete_local":               true,
+	"delete_remote":              true,
+	"delete_history_connection":  true,
 	"remote_read":                true,
 	"remote_write":               true,
 	"remote_edit":                true,
 	"remote_multi_edit":          true,
 	"remote_glob":                true,
 	"remote_grep":                true,
+	// 面板与标签页（ui-tools-orcaterm-explorer 一侧）
+	"open_file_manager":     true,
+	"close_file_manager":    true,
+	"open_tab_page":         true,
+	"close_tab_page":        true,
+	"open_next_tab_page":    true,
+	"open_last_tab_page":    true,
+	"open_proj":             true,
+	"open_session_recorder": true,
+	"open_light":            true,
+	"search_light":          true,
+	"close_panel":           true,
+	"close_approval_panel":  true,
+	"send_offer":            true,
 	// 设置与防火墙
 	"get_orcaterm_settings":    true,
 	"update_orcaterm_settings": true,
@@ -1169,10 +1223,6 @@ func normalizeToolPolicy(req *ChatCompletionRequest, mode string) (toolPolicy, s
 		return toolPolicy{}, "conflicting_tool_schemas",
 			fmt.Errorf("tools and functions cannot be used in the same request")
 	}
-	if req.ParallelToolCalls != nil && *req.ParallelToolCalls {
-		return toolPolicy{}, "parallel_tool_calls_unsupported",
-			fmt.Errorf("parallel_tool_calls is not supported; the upstream handles one pending call at a time")
-	}
 	p := toolPolicy{Tools: req.Tools, Dialect: "modern", Mode: mode}
 	choiceRaw := req.ToolChoice
 	if len(req.Functions) > 0 {
@@ -1192,26 +1242,36 @@ func normalizeToolPolicy(req *ChatCompletionRequest, mode string) (toolPolicy, s
 		return toolPolicy{}, "tools_unsupported",
 			fmt.Errorf("tool requests are rejected because ORCATERM_TOOLS_MODE=error")
 	}
-	if mode == "native" {
-		seen := map[string]bool{}
-		for _, tool := range p.Tools {
-			name := strings.TrimSpace(tool.Function.Name)
-			if tool.Type != "" && tool.Type != "function" {
-				return toolPolicy{}, "custom_tools_unsupported",
-					fmt.Errorf("tool type %q is not supported", tool.Type)
-			}
-			if !nativeToolNames[name] {
-				return toolPolicy{}, "custom_tools_unsupported",
-					fmt.Errorf("custom tool %q cannot be registered upstream; supported names: %s",
-						name, strings.Join(nativeToolNameList(), ", "))
-			}
-			if seen[name] {
-				return toolPolicy{}, "duplicate_tool", fmt.Errorf("tool %q is declared more than once", name)
-			}
-			seen[name] = true
+	// 重复声明在任何模式下都是调用方的笔误，直接拒绝。
+	seen := map[string]bool{}
+	nativeCount := 0
+	for _, tool := range p.Tools {
+		name := strings.TrimSpace(tool.Function.Name)
+		if seen[name] {
+			return toolPolicy{}, "duplicate_tool", fmt.Errorf("tool %q is declared more than once", name)
 		}
+		seen[name] = true
+		if tool.Type != "" && tool.Type != "function" {
+			return toolPolicy{}, "custom_tools_unsupported",
+				fmt.Errorf("tool type %q is not supported", tool.Type)
+		}
+		if nativeToolNames[name] {
+			nativeCount++
+			continue
+		}
+		if name == "" {
+			return toolPolicy{}, "custom_tools_unsupported", fmt.Errorf("tool name must not be empty")
+		}
+		if mode == toolsModeNative {
+			return toolPolicy{}, "custom_tools_unsupported",
+				fmt.Errorf("custom tool %q cannot be registered upstream; supported names: %s",
+					name, strings.Join(nativeToolNameList(), ", "))
+		}
+		p.Unsupported = append(p.Unsupported, name)
 	}
-	p.Enabled = len(p.Tools) > 0 && choice != "none" && mode == "native"
+	// 只在调用方确实声明了原生工具时才启用上游原生工具服务：
+	// 否则上游可能返回调用方无法执行的工具调用，反而把一轮对话变成硬错误。
+	p.Enabled = nativeCount > 0 && choice != "none" && (mode == toolsModePass || mode == toolsModeNative)
 	return p, "", nil
 }
 
@@ -1282,6 +1342,14 @@ func (ps *ProxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Requ
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", code, "%v", err)
 		return
 	}
+	if len(policy.Unsupported) > 0 {
+		// 这些工具上游没有，永远不会被调用。用响应头 + 日志暴露，
+		// 避免调用方以为自己的工具已经生效（pass 模式存在的意义就是不静默）。
+		w.Header().Set("X-OrcaTerm-Unsupported-Tools", strings.Join(policy.Unsupported, ","))
+		log.Printf("[WARN] 调用方声明了 %d 个 OrcaTerm 上游没有的工具，它们不会被调用: %s"+
+			"（需要严格校验请设 ORCATERM_TOOLS_MODE=native）",
+			len(policy.Unsupported), strings.Join(policy.Unsupported, ", "))
+	}
 	creds, ok := ps.cookies.Get()
 	if !ok {
 		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", "not_logged_in", "OrcaTerm not logged in. Please sign into OrcaTerm first.")
@@ -1296,12 +1364,14 @@ func (ps *ProxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Requ
 	if key == "" {
 		key = req.SessionID
 	}
-	// 先探测是否是工具结果轮次：工具结果必须复用已有 conversation，不能新建会话。
-	probe, err := extractInputPlan(req.Messages, false)
+	// 先解析尾部工具结果，并判断它到底是不是"我方 OrcaTerm 工具"的结果：
+	// agent 客户端会回放自己工具（Agent / Bash…）的结果，那是本轮输入，不是待回填调用。
+	toolResults, hasToolResult, err := trailingToolResults(req.Messages)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", inputPlanErrorCode(err), "%v", err)
 		return
 	}
+	ourToolResult := hasToolResult && !HasForeignToolResult(toolResults)
 	var lease *Lease
 	var plan *InputPlan
 	committed := false
@@ -1310,8 +1380,14 @@ func (ps *ProxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Requ
 			_ = lease.Rollback()
 		}
 	}()
-	if probe.IsToolResult {
-		result := probe.Results[0]
+	if ourToolResult {
+		// 上游一次只维护一个待处理调用，多个结果无法确定回填哪一个；先于任何 store 操作拒绝。
+		if len(toolResults) != 1 {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "multiple_tool_results_unsupported",
+				"%d OrcaTerm tool results in one request; the upstream handles one pending call at a time", len(toolResults))
+			return
+		}
+		result := toolResults[0]
 		var pending PendingCall
 		if result.Legacy {
 			if key == "" {
@@ -1331,6 +1407,7 @@ func (ps *ProxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Requ
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", storeErrorCode(err), "%v", err)
 			return
 		}
+		// 上游一次只维护一个待处理调用，多个结果无法确定回填哪一个。
 		if name := strings.TrimSpace(result.Name); name != "" && name != pending.Name {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "tool_result_name_mismatch",
 				"tool result name %q does not match pending tool %q", name, pending.Name)
@@ -1354,14 +1431,20 @@ func (ps *ProxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Requ
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", sessionAcquireErrorCode(err), "%v", err)
 			return
 		}
-		// lease.Session 是拿到同一 CID 租约之后取得的快照，因此并发请求看到的也是
-		// 串行化之后的轮次：新建会话或上游尚无历史轮次时都按首轮处理，
-		// 必须发送完整 system + 初始历史。
-		multiTurn := key != "" && lease.Session.Turns > 0
-		plan, err = extractInputPlan(req.Messages, multiTurn)
-		if err != nil {
-			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", inputPlanErrorCode(err), "%v", err)
-			return
+		switch {
+		case hasToolResult:
+			// 调用方自己工具的结果：当成本轮输入交给上游，输出不丢，也不去碰 pending call。
+			plan = &InputPlan{Text: RenderClientToolResults(toolResults), Results: toolResults}
+		default:
+			// lease.Session 是拿到同一 CID 租约之后取得的快照，因此并发请求看到的也是
+			// 串行化之后的轮次：新建会话或上游尚无历史轮次时都按首轮处理，
+			// 必须发送完整 system + 初始历史。
+			multiTurn := key != "" && lease.Session.Turns > 0
+			plan, err = extractInputPlan(req.Messages, multiTurn)
+			if err != nil {
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", inputPlanErrorCode(err), "%v", err)
+				return
+			}
 		}
 	}
 	input, images := plan.Text, plan.Images
@@ -1889,7 +1972,8 @@ const corsAllowedHeaders = "Content-Type, Authorization, X-Session-Id, OpenAI-Or
 // corsExposedHeaders 浏览器可读的自定义响应头。
 const corsExposedHeaders = "X-OrcaTerm-Action, X-OrcaTerm-Degraded, X-OrcaTerm-Session, X-OrcaTerm-Turn, " +
 	"X-OrcaTerm-Context-Used, X-OrcaTerm-Context-Limit, X-OrcaTerm-Context-Remaining, " +
-	"X-OrcaTerm-Usage-Estimated, X-OrcaTerm-Tool-Result-Turn, X-OrcaTerm-Model, X-OrcaTerm-Model-Id"
+	"X-OrcaTerm-Usage-Estimated, X-OrcaTerm-Tool-Result-Turn, X-OrcaTerm-Model, X-OrcaTerm-Model-Id, " +
+	"X-OrcaTerm-Unsupported-Tools"
 
 // corsMiddleware 按 allowlist 处理跨域。
 //

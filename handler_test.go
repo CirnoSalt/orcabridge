@@ -132,7 +132,7 @@ func newTestProxy(t *testing.T, upstream string, mutate func(*Config)) *ProxySer
 		HideTools:     true,
 		SessionTTL:    time.Hour,
 		SessionMax:    100,
-		ToolsMode:     "native",
+		ToolsMode:     toolsModePass,
 		ContextLimit:  128000,
 	}
 	if mutate != nil {
@@ -608,10 +608,11 @@ func TestNormalizeToolPolicy(t *testing.T) {
 			mode: "native", wantDial: "legacy", wantChoice: "none"},
 		{name: "parallel false", req: ChatCompletionRequest{Tools: nativeDecl, ParallelToolCalls: boolPtr(false)},
 			mode: "native", wantDial: "modern", wantChoice: "auto", wantEnable: true},
+		// parallel_tool_calls=true 只是"允许并行"，上游只产出一个调用也是合法响应
+		{name: "parallel true", req: ChatCompletionRequest{Tools: nativeDecl, ParallelToolCalls: boolPtr(true)},
+			mode: "native", wantDial: "modern", wantChoice: "auto", wantEnable: true},
 		{name: "conflict", req: ChatCompletionRequest{Tools: nativeDecl, Functions: legacyDecl},
 			mode: "native", wantCode: "conflicting_tool_schemas"},
-		{name: "parallel true", req: ChatCompletionRequest{Tools: nativeDecl, ParallelToolCalls: boolPtr(true)},
-			mode: "native", wantCode: "parallel_tool_calls_unsupported"},
 		{name: "required", req: ChatCompletionRequest{Tools: nativeDecl, ToolChoice: json.RawMessage(`"required"`)},
 			mode: "native", wantCode: "tool_choice_required_unsupported"},
 		{name: "named", req: ChatCompletionRequest{Tools: nativeDecl, ToolChoice: json.RawMessage(`"fetch"`)},
@@ -665,7 +666,8 @@ func TestChatRejectsInvalidToolSchemas(t *testing.T) {
 	fake := newFakeUpstream(t, func(int, map[string]interface{}) (int, string, string) {
 		return completionPayload("x")
 	})
-	ps := newTestProxy(t, fake.server.URL, nil)
+	// 这些用例校验的是**严格模式**的行为，所以显式用 native。
+	ps := newTestProxy(t, fake.server.URL, func(c *Config) { c.ToolsMode = toolsModeNative })
 	base := map[string]interface{}{"model": "deepseek-v4-flash", "messages": []interface{}{userMessage("hi")}}
 
 	cases := []struct {
@@ -677,10 +679,6 @@ func TestChatRejectsInvalidToolSchemas(t *testing.T) {
 			"tools":     []interface{}{map[string]interface{}{"type": "function", "function": map[string]interface{}{"name": "fetch"}}},
 			"functions": []interface{}{map[string]interface{}{"name": "fetch"}},
 		}, "conflicting_tool_schemas"},
-		{"parallel", map[string]interface{}{
-			"tools":               []interface{}{map[string]interface{}{"type": "function", "function": map[string]interface{}{"name": "fetch"}}},
-			"parallel_tool_calls": true,
-		}, "parallel_tool_calls_unsupported"},
 		{"required", map[string]interface{}{
 			"tools":       []interface{}{map[string]interface{}{"type": "function", "function": map[string]interface{}{"name": "fetch"}}},
 			"tool_choice": "required",
@@ -691,6 +689,9 @@ func TestChatRejectsInvalidToolSchemas(t *testing.T) {
 		}, "forced_tool_choice_unsupported"},
 		{"custom", map[string]interface{}{
 			"tools": []interface{}{map[string]interface{}{"type": "function", "function": map[string]interface{}{"name": "not_a_native_tool"}}},
+		}, "custom_tools_unsupported"},
+		{"non function type", map[string]interface{}{
+			"tools": []interface{}{map[string]interface{}{"type": "retrieval", "function": map[string]interface{}{"name": "fetch"}}},
 		}, "custom_tools_unsupported"},
 	}
 	for _, c := range cases {
@@ -710,6 +711,107 @@ func TestChatRejectsInvalidToolSchemas(t *testing.T) {
 				t.Errorf("错误码 = %q，期望 %q", code, c.code)
 			}
 		})
+	}
+
+	// parallel_tool_calls=true 只是"允许并行"：上游只返回一个调用也是合法响应，不该拒绝。
+	t.Run("parallel accepted", func(t *testing.T) {
+		pass := newTestProxy(t, fake.server.URL, nil)
+		res := doChat(t, pass, map[string]interface{}{
+			"model":               "deepseek-v4-flash",
+			"messages":            []interface{}{userMessage("hi")},
+			"parallel_tool_calls": true,
+			"tools": []interface{}{
+				map[string]interface{}{"type": "function", "function": map[string]interface{}{"name": "fetch"}},
+			},
+		}, nil)
+		if res.Status != http.StatusOK {
+			t.Fatalf("parallel_tool_calls=true 应被接受，实际 %d: %s", res.Status, res.Body)
+		}
+	})
+}
+
+// 真机回归：ZCode 等 agent 客户端会声明自己的一套工具（Agent/Bash/Read…）。
+// 默认的 pass 模式必须接受它们，否则客户端每次请求都 400，代理等于不可用。
+func TestPassModeAcceptsForeignAgentTools(t *testing.T) {
+	fake := newFakeUpstream(t, func(int, map[string]interface{}) (int, string, string) {
+		return completionPayload("我是 OrcaTerm 助手。")
+	})
+	ps := newTestProxy(t, fake.server.URL, nil) // 默认 pass
+
+	foreign := []string{"Agent", "Bash", "Read", "Write", "Edit", "Glob", "Grep"}
+	tools := make([]interface{}, 0, len(foreign))
+	for _, name := range foreign {
+		tools = append(tools, map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name": name, "description": name + " tool",
+				"parameters": map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+			},
+		})
+	}
+	res := doChat(t, ps, map[string]interface{}{
+		"model":    "hy4-preview",
+		"messages": []interface{}{userMessage("你好")},
+		"tools":    tools,
+	}, nil)
+	if res.Status != http.StatusOK {
+		t.Fatalf("ZCode 式工具声明应被接受，实际 %d: %s", res.Status, res.Body)
+	}
+	if got := res.Header.Get("X-OrcaTerm-Unsupported-Tools"); got != strings.Join(foreign, ",") {
+		t.Errorf("未如实暴露被忽略的工具名: %q", got)
+	}
+	if fake.count() != 1 {
+		t.Fatalf("上游调用次数 = %d", fake.count())
+	}
+	// 只声明了外来工具 → 不应启用上游原生工具服务
+	if got := settingOf(t, fake.call(t, 0).Body)["mcpServers"]; !reflect.DeepEqual(got, []interface{}{}) {
+		t.Errorf("未声明原生工具时不应启用 mcpServers: %#v", got)
+	}
+
+	// 混入原生工具时启用原生服务，同时仍如实暴露外来名字
+	mixed := append([]interface{}{
+		map[string]interface{}{"type": "function", "function": map[string]interface{}{"name": "fetch"}},
+	}, tools...)
+	res = doChat(t, ps, map[string]interface{}{
+		"model":    "hy4-preview",
+		"messages": []interface{}{userMessage("你好")},
+		"tools":    mixed,
+	}, nil)
+	if res.Status != http.StatusOK {
+		t.Fatalf("混合声明应被接受，实际 %d: %s", res.Status, res.Body)
+	}
+	if got := res.Header.Get("X-OrcaTerm-Unsupported-Tools"); got != strings.Join(foreign, ",") {
+		t.Errorf("混合声明下被忽略的工具名不符: %q", got)
+	}
+	if got := settingOf(t, fake.call(t, 1).Body)["mcpServers"]; !reflect.DeepEqual(got, []interface{}{"mcp-server-orcaterm-oauth"}) {
+		t.Errorf("声明了 fetch 时应启用原生工具服务: %#v", got)
+	}
+
+	// 严格模式仍然可用
+	strict := newTestProxy(t, fake.server.URL, func(c *Config) { c.ToolsMode = toolsModeNative })
+	res = doChat(t, strict, map[string]interface{}{
+		"model":    "hy4-preview",
+		"messages": []interface{}{userMessage("你好")},
+		"tools":    tools,
+	}, nil)
+	if res.Status != http.StatusBadRequest || errorCodeOf(t, res) != "custom_tools_unsupported" {
+		t.Fatalf("native 模式应拒绝外来工具，实际 %d: %s", res.Status, res.Body)
+	}
+
+	// legacy functions 同理
+	res = doChat(t, ps, map[string]interface{}{
+		"model":    "hy4-preview",
+		"messages": []interface{}{userMessage("你好")},
+		"functions": []interface{}{
+			map[string]interface{}{"name": "Agent"},
+			map[string]interface{}{"name": "fetch"},
+		},
+	}, nil)
+	if res.Status != http.StatusOK {
+		t.Fatalf("legacy functions 外来名应被接受，实际 %d: %s", res.Status, res.Body)
+	}
+	if got := res.Header.Get("X-OrcaTerm-Unsupported-Tools"); got != "Agent" {
+		t.Errorf("legacy 声明下被忽略的工具名不符: %q", got)
 	}
 }
 

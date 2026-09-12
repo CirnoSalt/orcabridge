@@ -267,6 +267,12 @@ TOOLS = [
         "name": "list_terminals", "description": "列出可用的终端会话",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
+        "name": "select_connect_config", "description": "选择一个已保存的连接配置",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "list_connect_configs", "description": "列出已保存的连接配置",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
         "name": "get_terminal_detail", "description": "查看终端详情",
         "parameters": {"type": "object", "properties": {"terminalId": {"type": "string"}}}}},
     {"type": "function", "function": {
@@ -303,8 +309,9 @@ if tool_calls:
     check("content 为 null",
           (body.get("choices") or [{}])[0].get("message", {}).get("content") is None)
     check("工具名在原生 allowlist 内", call["function"]["name"] in (
-        "fetch", "list_terminals", "get_terminal_detail", "get_terminal_output",
-        "execute_terminal_command", "send_terminal_signal", "list_connect_configs",
+        "fetch", "list_terminals", "select_connect_config", "list_connect_configs",
+        "get_terminal_detail", "get_terminal_output", "get_active_terminal",
+        "execute_terminal_command", "send_terminal_signal",
         "get_command_history"), call["function"]["name"])
     messages = [
         {"role": "user", "content": task},

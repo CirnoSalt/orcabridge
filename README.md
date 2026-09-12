@@ -9,7 +9,8 @@
 - 支持 `POST /v1/chat/completions`、`GET /v1/models`、多轮会话、图片输入、合成 SSE 和估算 usage。
 - 支持的主要请求字段：`model`、`messages`、`stream`、`stream_options.include_usage`、`user`、`tools`。
 - 不是 OpenAI API 的完整实现；未列出的采样、响应格式及批处理能力不要假定有效。
-- tools 是 **OrcaTerm 原生工具桥接**，不是任意 OpenAI function 执行器：不能注册任意自定义 function，不支持强制指定 tool choice，也不支持并行工具调用。
+- tools 是 **OrcaTerm 原生工具桥接**，不是任意 OpenAI function 执行器：不能注册任意自定义 function，不支持强制指定 tool choice，一次也只产出一个工具调用。
+- 第三方 agent 客户端（ZCode / Cline / Roo 等）声明自己的工具集是允许的：默认 `pass` 模式会接受，并通过响应头 `X-OrcaTerm-Unsupported-Tools` 如实列出上游没有的那些名字。
 - `structured` 与 `raw-stream` 都会先完整读取并解析上游响应，再输出普通 JSON 或合成 SSE；`stream: true` 主要用于客户端协议兼容，不提供上游首 token 低延迟。
 
 ## 快速开始
@@ -91,7 +92,9 @@ curl http://localhost:8080/v1/chat/completions `
 
 现代格式使用 `assistant.tool_calls[].id` 与 `role:"tool"` 的 `tool_call_id` 关联。在本修复版本中，只要完整回传对应消息，现代 tool result 可在没有私有 `X-Session-Id` 请求头时闭环；仍可使用 `X-Session-Id` 或 `user` 显式维持会话。
 
-旧式 `role:"function"` 结果没有 `tool_call_id`，无法仅靠消息可靠关联待处理调用，因此必须复用原来的 `X-Session-Id` 或 `user`。同一时刻只处理一个工具调用；不支持并行调用。工具 `content` 为空字符串表示拒绝执行。
+旧式 `role:"function"` 结果没有 `tool_call_id`，无法仅靠消息可靠关联待处理调用，因此必须复用原来的 `X-Session-Id` 或 `user`。原生工具一次只处理一个待处理调用；调用方传 `parallel_tool_calls` 是允许的，代理只返回一个调用。工具 `content` 为空字符串表示拒绝执行。
+
+客户端回放**自己**工具的结果（`role:"tool"` 且 id 不是代理发出的）不会被当作待回填调用，而是作为本轮输入送进上游，`content` 不会丢。代理只在工具名属于 OrcaTerm 原生工具时才去匹配待处理调用。
 
 上游不支持的能力会显式报错而不是静默忽略：同时传 `tools` 与 `functions`、`tool_choice:"required"`、具名强制选择、`parallel_tool_calls:true`、自定义 function、一次回传多个工具结果，以及缺少 `tool_call_id` 的 `role:"tool"` 都会返回 400，错误码见分析报告 §4.2。
 
@@ -116,7 +119,7 @@ $env:ORCATERM_CORS_ORIGINS="http://localhost:3000,https://app.example.com"
 | `ORCATERM_ALLOW_UNKNOWN_MODEL` | `0` | `0` / `1` |
 | `ORCATERM_MODE` | `structured` | `structured` / `raw-stream`；两者均先完整解析 |
 | `ORCATERM_ON_DEGRADED` | `empty` | `empty` / `raw` / `error` |
-| `ORCATERM_TOOLS_MODE` | `native` | `native` / `ignore` / `error`；`inject` 仅为 legacy 模拟且不可靠 |
+| `ORCATERM_TOOLS_MODE` | `pass` | `pass` / `native` / `ignore` / `error`；`inject` 仅为 legacy 模拟且不可靠。见分析报告 §4.4 |
 | `ORCATERM_HIDE_TOOLS` | `1` | `1` 要求上游隐藏内部工具消息；`0` 关闭 HideTools |
 | `ORCATERM_STRIP_PERSONA` | `1` | `0` / `1`，清洗兜底 |
 | `ORCATERM_SESSION_TTL` | `30m` | Go duration，如 `10m`、`1h` |

@@ -137,13 +137,20 @@ func TestUpstreamCodeUnmarshal(t *testing.T) {
 func TestNativeToolAllowlistCoversTerminalChain(t *testing.T) {
 	chain := []string{
 		"fetch", "list_terminals", "get_terminal_detail", "get_terminal_output",
-		"execute_terminal_command", "send_terminal_signal", "list_connect_configs",
-		"get_command_history", "execute_command", "create_command", "query_commands_status",
+		"get_active_terminal", "execute_terminal_command", "send_terminal_signal",
+		"get_command_history", "list_connect_configs", "select_connect_config",
+		"connect_by_history_session", "connect_share", "connect_share_visit",
+		"get_confirmed_session", "close_tunnel",
+		"execute_command", "create_command", "query_commands_status",
 		"run_commands", "run_sandbox_task", "submit_agent_tasks", "query_agent_tasks_status",
 		"read_cloud_space_file", "read_cloud_space_file_list", "create_cloud_space_file",
+		"create_file", "create_directory", "delete_local", "delete_remote",
+		"delete_history_connection",
 		"remote_read", "remote_write", "remote_edit", "remote_multi_edit", "remote_glob",
 		"remote_grep", "get_orcaterm_settings", "update_orcaterm_settings",
 		"create_firewall_rules", "delete_firewall_rules",
+		"open_file_manager", "close_file_manager", "open_tab_page", "close_tab_page",
+		"open_proj", "open_session_recorder", "search_light", "close_panel", "send_offer",
 	}
 	for _, name := range chain {
 		if !nativeToolNames[name] {

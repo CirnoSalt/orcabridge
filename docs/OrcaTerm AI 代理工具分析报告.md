@@ -12,7 +12,9 @@ OrcaBridge 读取本机 OrcaTerm 登录态，将 `lightai.cloud.tencent.com/assi
 
 1. 模型目录有 17 个唯一上游模型：8 个 current、9 个 legacy；默认还暴露 deprecated alias `orcaterm-assistant`，所以 `/v1/models` 默认有 18 个列表项。
 2. `structured` 和 `raw-stream` 都先完整读取、解析上游响应，再生成 OpenAI JSON 或合成 SSE；两种模式都不是首 token 低延迟直通。
-3. tools 是 OrcaTerm 原生工具桥接，不能注册任意自定义 function，不支持强制 tool choice，也不支持并行工具。
+3. tools 是 OrcaTerm 原生工具桥接：不能注册任意自定义 function，不支持强制 tool choice，
+   一次只产出一个工具调用。第三方 agent 客户端自己的工具声明会被接受但不会被调用，
+   并通过响应头 `X-OrcaTerm-Unsupported-Tools` 如实暴露（见 §4.4）。
 4. 现代 `tool_call_id` 可在无私有 session header 时关联闭环；legacy `role:"function"` 结果没有调用 id，必须复用会话键。
 5. system 是首轮会话语义；CORS 默认关闭，管理端点应视为敏感接口。
 
@@ -64,7 +66,7 @@ POST https://lightai.cloud.tencent.com/assistant/chat
 | tools | 仅桥接 OrcaTerm 原生工具 |
 | 自定义 function | 不支持，上游不能由客户端注册 |
 | 强制 tool choice | 不支持；由上游模型自动决定 |
-| 并行工具 | 不支持；一次只维护一个待处理调用 |
+| 并行工具 | 上游一次只产出一个调用；调用方可传 `parallel_tool_calls`，代理只返回一个 |
 
 未明确列出的 OpenAI 字段或端点不属于兼容承诺。调用方不应假定 `temperature`、`top_p`、`response_format`、多 choice 或批处理等能力生效。
 
@@ -112,19 +114,26 @@ POST https://lightai.cloud.tencent.com/assistant/chat
 {"action":"review","tool":{"type":"mcp","name":"fetch","args":{"url":"https://example.com"}}}
 ```
 
-代理将其转换为 OpenAI `assistant.tool_calls`。可声明的名称必须对应 OrcaTerm 已注册工具。这些名字取自客户端前端 bundle 的 V8 code cache 字符串表并逐项真机验证过：
+代理将其转换为 OpenAI `assistant.tool_calls`。可声明的名称必须对应 OrcaTerm 已注册工具。
 
 | 分组 | 原生工具名 |
 |---|---|
 | 网页抓取 | `fetch` |
-| 终端会话 | `list_terminals`、`get_terminal_detail`、`get_terminal_output`、`execute_terminal_command`、`send_terminal_signal`、`list_connect_configs`、`get_command_history` |
+| 终端会话 | `list_terminals`、`get_terminal_detail`、`get_terminal_output`、`get_active_terminal`、`execute_terminal_command`、`send_terminal_signal`、`get_command_history` |
+| 连接与隧道 | `list_connect_configs`、`select_connect_config`、`connect_by_history_session`、`connect_share`、`connect_share_visit`、`get_confirmed_session`、`close_tunnel` |
 | 命令与任务 | `execute_command`、`create_command`、`query_commands_status`、`run_commands`、`run_sandbox_task`、`submit_agent_tasks`、`query_agent_tasks_status` |
-| 云空间与远程文件 | `read_cloud_space_file`、`read_cloud_space_file_list`、`create_cloud_space_file`、`remote_read`、`remote_write`、`remote_edit`、`remote_multi_edit`、`remote_glob`、`remote_grep` |
+| 云空间与远程文件 | `read_cloud_space_file`、`read_cloud_space_file_list`、`create_cloud_space_file`、`create_file`、`create_directory`、`delete_local`、`delete_remote`、`delete_history_connection`、`remote_read`、`remote_write`、`remote_edit`、`remote_multi_edit`、`remote_glob`、`remote_grep` |
+| 面板与标签页 | `open_file_manager`、`close_file_manager`、`open_tab_page`、`close_tab_page`、`open_next_tab_page`、`open_last_tab_page`、`open_proj`、`open_session_recorder`、`open_light`、`search_light`、`close_panel`、`close_approval_panel`、`send_offer` |
 | 设置与防火墙 | `get_orcaterm_settings`、`update_orcaterm_settings`、`create_firewall_rules`、`delete_firewall_rules` |
 
-**终端类任务是一条工具链**：真机实测只声明 `execute_terminal_command` 时，上游会先请求 `list_terminals` 去枚举终端，于是整条任务直接失败。调用方应把可能用到的整条链路一次性声明。
+**这是一份快照，不是权威全量**：上游真正的工具表由服务端下发，客户端 bundle 只留名字字符串。
+刷新方式：`tools/reverse/native_tools_scan.py`（加 `--go` 直接产出可粘贴的 Go 条目）。
 
-`tools` 声明不能向上游注册新的任意 function；表外的名字一律 400 `custom_tools_unsupported`。
+**终端类任务是一条工具链**：真机实测只声明 `execute_terminal_command` 时，上游会先请求 `list_terminals`；
+只声明终端四件套时，上游又会先请求 `select_connect_config` 去选连接配置。任何一环缺失都会在任务中途
+撞上 502 `upstream_requested_undeclared_tool`。调用方应把可能用到的整条链路一次性声明。
+
+`tools` 声明无法向上游注册新的任意 function，表外的名字**不会**被注册到上游（见 §4.4）。
 
 工具结果按真机协议回传到对应 conversationId：
 
@@ -139,7 +148,7 @@ POST https://lightai.cloud.tencent.com/assistant/chat
 
 现代格式通过 `assistant.tool_calls[].id` 和 `role:"tool"` 的 `tool_call_id` 明确关联。本修复版本可从完整消息链识别对应调用并完成闭环，因此不强制私有 `X-Session-Id`；显式会话键仍可用于稳定的多轮上下文。
 
-legacy `role:"function"` 结果不含 `tool_call_id`，仅靠消息无法可靠定位待处理调用，必须复用触发工具调用时的 `X-Session-Id` 或 `user`。代理不支持同时挂起或回传多个并行工具调用，也不支持强制选择指定工具。
+legacy `role:"function"` 结果不含 `tool_call_id`，仅靠消息无法可靠定位待处理调用，必须复用触发工具调用时的 `X-Session-Id` 或 `user`。代理不支持同时挂起或回传多个并行**原生**工具调用，也不支持强制选择指定工具；调用方自己工具的结果不受此限制（见 §4.4）。
 
 ### 4.2 明确拒绝的用法
 
@@ -150,11 +159,10 @@ legacy `role:"function"` 结果不含 `tool_call_id`，仅靠消息无法可靠�
 | 同时传非空 `tools` 与 `functions` | 400 | `conflicting_tool_schemas` |
 | `tool_choice:"required"` | 400 | `tool_choice_required_unsupported` |
 | 具名强制选择（`tool_choice:"fetch"` 或对象形式） | 400 | `forced_tool_choice_unsupported` |
-| `parallel_tool_calls:true` | 400 | `parallel_tool_calls_unsupported` |
-| 声明非 OrcaTerm 原生工具（自定义 function / 非 `function` 类型） | 400 | `custom_tools_unsupported` |
+| 声明表外工具（自定义 function / 非 `function` 类型） | 400 | `custom_tools_unsupported`（仅 `native` 模式；默认 `pass` 会接受并暴露） |
 | 重复声明同名工具 | 400 | `duplicate_tool` |
 | `role:"tool"` 缺少 `tool_call_id` | 400 | `tool_call_id_required` |
-| 一次回传多个工具结果 | 400 | `multiple_tool_results_unsupported` |
+| 一次回传多个**原生**工具结果 | 400 | `multiple_tool_results_unsupported` |
 | legacy `role:"function"` 结果但未提供会话键 | 400 | `legacy_function_result_requires_session` |
 | 工具结果名与待处理调用名不一致 | 400 | `tool_result_name_mismatch` |
 | 未知 / 已消费 / 过期 / 会话不符 / 正在处理中的 `tool_call_id` | 400 | `unknown_tool_call_id` / `tool_call_already_consumed` / `expired_tool_call_id` / `tool_call_mismatch` / `tool_call_in_flight` |
@@ -167,7 +175,38 @@ legacy `role:"function"` 结果不含 `tool_call_id`，仅靠消息无法可靠�
 
 上游错误正文在对外错误信息中最多保留 300 字符，不会把完整上游响应透传给调用方。`tool_choice:"none"` 与 `function_call:"none"` 是合法值，表示不启用上游原生工具。
 
-### 4.3 上游 `code` 的两种形态
+`parallel_tool_calls` 接受 `true` / `false`，不再拒绝：它表达的是"**允许**并行"，而上游一次只产出一个调用，
+"只返回一个调用"本身就是该字段的合法响应。代理不会伪造第二个调用。
+
+### 4.4 与第三方 agent 客户端的兼容（tools 模式）
+
+真实的 agent 客户端（ZCode / Cline / Roo 等）都会声明**自己的一套工具**（`Agent`、`Bash`、`Read`…），
+而这些名字上游一个都没有。如果因此拒绝请求，客户端每次调用都会 400，代理等于不可用。
+
+因此 `ORCATERM_TOOLS_MODE` 默认是 `pass`：
+
+| 值 | 行为 |
+|---|---|
+| `pass`（默认） | 接受任意工具声明。只有声明里含原生工具时才启用上游原生工具服务；外来名字记入响应头 `X-OrcaTerm-Unsupported-Tools` 并打 `[WARN]` 日志 |
+| `native` | 严格模式：表外名字 400 `custom_tools_unsupported`，适合想靠代理校验工具名拼写的场景 |
+| `ignore` | 忽略 tools 声明：不校验，也不启用原生工具服务 |
+| `error` | 只要声明了 tools 就 400 `tools_unsupported` |
+| `inject` | legacy 提示词注入模拟，不可靠 |
+
+`pass` 模式的设计要点是**接受但不静默**：被忽略的工具名一定会在响应头与日志里出现，
+调用方不会误以为自己的工具已经生效。
+
+客户端回放**自己**工具的结果（`role:"tool"`，id 不是代理发过的）不会被当成待回填调用，
+而是作为本轮输入送进上游，`content` 不会丢；代理只在工具名为原生工具时才去匹配待处理调用。
+多个客户端工具结果也允许（"一次只能一个"的限制只针对原生工具）。
+
+### 4.5 上游请求了未声明的工具
+
+上游偶尔会请求调用方没声明的原生工具（见 §4 的工具链说明）。代理返回
+502 `upstream_requested_undeclared_tool`，**不创建 pending call**，并在错误消息里点名是哪个工具。
+这是刻意的硬失败：静默丢弃会让调用方拿到一个看起来正常、实际半途而废的回答。
+
+### 4.6 上游 `code` 的两种形态
 
 实测（2026-09-12 真机）上游的 `code` 字段有两种写法：
 
@@ -205,7 +244,7 @@ OrcaTerm 登录态已失效，请在 OrcaTerm 客户端重新登录后重试
 | `PROXY_PORT` | `8080` | 端口字符串 |
 | `ORCATERM_MODE` | `structured` | `structured` / `raw-stream` |
 | `ORCATERM_ON_DEGRADED` | `empty` | `empty` / `raw` / `error` |
-| `ORCATERM_TOOLS_MODE` | `native` | `native` / `ignore` / `error`；`inject` 为 legacy、不可靠 |
+| `ORCATERM_TOOLS_MODE` | `pass` | `pass` / `native` / `ignore` / `error`；`inject` 为 legacy、不可靠。见 §4.4 |
 | `ORCATERM_HIDE_TOOLS` | `1` | `1` 开启 HideTools，`0` 关闭 |
 | `ORCATERM_STRIP_PERSONA` | `1` | `0` / `1` |
 | `ORCATERM_ALLOW_UNKNOWN_MODEL` | `0` | `0` / `1` |
@@ -214,7 +253,7 @@ OrcaTerm 登录态已失效，请在 OrcaTerm 客户端重新登录后重试
 | `ORCATERM_CONTEXT_LIMIT` | `128000` | 正整数，仅供估算 |
 | `ORCATERM_CORS_ORIGINS` | 空 | 关闭；逗号分隔 origin allowlist，或显式 `*` |
 
-HideTools 控制发往上游 setting 的工具消息隐藏相关开关，用于抑制内部工具过程直接混入普通回答；它不增加工具能力，也不改变“不支持自定义 function、强制 tool choice、并行工具”的边界。
+HideTools 控制发往上游 setting 的工具消息隐藏相关开关，用于抑制内部工具过程直接混入普通回答；它不增加工具能力，也不改变"不支持自定义 function、强制 tool choice、一次只产出一个调用"的边界。
 
 ## 7. CORS、安全与端点
 

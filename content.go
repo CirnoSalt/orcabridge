@@ -679,6 +679,39 @@ func ToolsInstruction(tools []Tool) string {
 	return sb.String()
 }
 
+// IsOrcaToolName 判断名字是否属于 OrcaTerm 原生工具。
+func IsOrcaToolName(name string) bool { return nativeToolNames[name] }
+
+// HasForeignToolResult 判断尾部工具结果里是否有"调用方自己工具"的结果。
+//
+// agent 客户端（ZCode / Cline / Roo 等）自带一套工具（Agent / Bash / Read…），
+// 它们执行完会把自己的结果按 role="tool" 回放。这些结果不是我们的待处理调用，
+// 不能拿去 AcquireCall，否则会被误判成 unknown_tool_call_id 而 400。
+// 名字无法判定时按"我方"处理，保持原有的严格语义。
+func HasForeignToolResult(results []ToolResultMessage) bool {
+	for _, r := range results {
+		name := strings.TrimSpace(r.Name)
+		if name != "" && !IsOrcaToolName(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// RenderClientToolResults 把调用方自己执行的工具结果渲染成本轮输入，
+// 保证这些输出仍然会送进上游，而不是被丢掉。
+func RenderClientToolResults(results []ToolResultMessage) string {
+	var sb strings.Builder
+	for _, r := range results {
+		label := strings.TrimSpace(r.Name)
+		if label == "" {
+			label = "工具"
+		}
+		sb.WriteString("[工具结果 " + label + "]\n" + r.Content + "\n\n")
+	}
+	return strings.TrimSpace(sb.String())
+}
+
 // ExtractToolCalls 从模型输出中解析专用的 ```tool_calls 围栏。
 // 只有成功解析的专用围栏会从正文剥离，普通 Markdown/JSON 围栏一律保留。
 func ExtractToolCalls(text string) ([]ToolCall, string) {
