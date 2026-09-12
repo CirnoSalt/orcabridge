@@ -10,9 +10,12 @@ tools/reverse/ctx/
 
 # 本地 Python 虚拟环境（按需重建，见 tools/reverse/README.md）
 .venv-cdp/
+__pycache__/
+*.pyc
 
 # 助手工作区 / 本地笔记
 .workbuddy/
+.zcode/
 
 # 本地配置与凭据（切勿提交）
 .cookies

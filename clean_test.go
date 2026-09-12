@@ -5,85 +5,38 @@ import (
 	"testing"
 )
 
-// 纯人设开场白应被完全清洗掉
-func TestCleanAnswer_PurePersona(t *testing.T) {
+// 人设文本属于普通正文，协议清洗不得按关键词删除
+func TestCleanAnswer_PreservePersonaText(t *testing.T) {
 	in := "您好！我是 OrcaTerm AI，腾讯云 OrcaTerm（遨驰终端）内置的云端服务器运维专家。我可以帮助您：\n\n" +
 		"- **远程服务器管理**：通过浏览器直接登录和管理您的云服务器\n" +
 		"- **命令执行与运维**：执行 Shell 命令、排查故障\n" +
 		"- **腾讯云产品支持**：查询云产品文档\n\n" +
 		"请告诉我您需要什么帮助？"
-	if got := cleanAnswer(in); got != "" {
-		t.Errorf("期望清洗为空，实际: %q", got)
+	if got := cleanAnswer(in); got != in {
+		t.Errorf("普通正文不应被改写，实际: %q", got)
 	}
 }
 
-// 人设 + 真实答案混合时，必须保留真实答案
+// 人设与真实答案混合时同样原样保留
 func TestCleanAnswer_KeepRealAnswer(t *testing.T) {
 	in := "我是 OrcaTerm AI，云端服务器运维专家。\n" +
 		"- **远程服务器管理**：连接和管理云服务器\n" +
 		"- **故障排查**：分析日志、定位问题\n\n" +
 		"请告诉我您需要什么帮助？\n\n" +
 		"查看磁盘使用率使用 df -h 命令，查看目录占用用 du -sh。"
-	got := cleanAnswer(in)
-	if got == "" {
-		t.Fatal("清洗后不应为空")
-	}
-	if !contains(got, "df -h") || !contains(got, "du -sh") {
-		t.Errorf("真实答案被误删: %q", got)
-	}
-	if contains(got, "OrcaTerm AI") || contains(got, "请告诉我您需要什么帮助") {
-		t.Errorf("人设未被清干净: %q", got)
+	if got := cleanAnswer(in); got != in {
+		t.Errorf("混合正文不应被改写，实际: %q", got)
 	}
 }
 
-// 实测样本：两段真实上游开场白，都应被完全清空
-func TestCleanAnswer_RealSamples(t *testing.T) {
-	samples := []string{
-		"您好，我是 OrcaTerm AI，腾讯云 OrcaTerm（遨驰终端）内置的云端服务器运维助手。\n\n" +
-			"我可以帮您完成以下工作：\n\n" +
-			"- **远程服务器管理**：登录、执行命令、查看状态\n" +
-			"- **文件操作**：读取、编辑、搜索、创建远程文件\n" +
-			"- **软件部署与配置**：安装软件、修改配置、管理服务\n" +
-			"- **故障排查**：日志分析、性能诊断、问题定位\n" +
-			"- **腾讯云产品支持**：CVM、Lighthouse 等云资源管理\n\n" +
-			"请告诉我您需要处理的具体运维任务，我会立即开始协助您。",
-
-		"我是 OrcaTerm AI，您的云端服务器运维专家。我可以通过浏览器帮您远程登录并管理服务器，涵盖以下服务范围：\n\n" +
-			"- **远程服务器管理**：连接、登录、执行命令、启停服务\n" +
-			"- **文件操作**：读取、编辑、搜索、创建远程文件\n" +
-			"- **命令执行**：在终端中运行 Shell 命令，完成安装、部署、配置等任务\n" +
-			"- **腾讯云产品咨询**：查询云产品文档，解答使用问题\n" +
-			"- **故障排查**：日志分析、错误定位、性能诊断\n\n" +
-			"当前没有待处理的任务，请随时告诉我您需要什么帮助。",
-	}
-	for i, s := range samples {
-		if got := cleanAnswer(s); got != "" {
-			t.Errorf("样本%d 未清洗干净，残留: %q", i+1, got)
-		}
-	}
-}
-
-// 活动/营销内容（六周年送祝福）应被清除
-func TestCleanAnswer_StripActivity(t *testing.T) {
+// 周年、活动等业务关键词不是协议标记，必须原样保留
+func TestCleanAnswer_PreserveActivity(t *testing.T) {
 	in := "# Lighthouse 6 周年怎么玩\n" +
 		"1. **说说你的故事**：选一个使用场景\n" +
 		"2. **挑一种祝福方式**：从祝福方式中选择\n\n" +
-		"**活动规则**：送祝福可获得 1 次抽奖机会，将于 9 月 16 日开奖。\n\n" +
-		"### 选一个你的云上故事\n"
-	if got := cleanAnswer(in); got != "" {
-		t.Errorf("活动营销内容应被清空，实际: %q", got)
-	}
-}
-
-// 活动菜单的选项行（编号列表）在活动上下文中也应被丢弃
-func TestCleanAnswer_AggressiveOnActivity(t *testing.T) {
-	in := "# Lighthouse 6 周年怎么玩\n" +
-		"送祝福可获得 1 次抽奖机会。\n\n" +
-		"1. 搭过第一个网站/博客\n" +
-		"2. 跑过课程作业/小项目\n" +
-		"3. 藏梗整活\n"
-	if got := cleanAnswer(in); got != "" {
-		t.Errorf("活动上下文下的选项行应被清空，实际: %q", got)
+		"**活动规则**：送祝福可获得 1 次抽奖机会，将于 9 月 16 日开奖。"
+	if got := cleanAnswer(in); got != in {
+		t.Errorf("周年活动正文不应被改写，实际: %q", got)
 	}
 }
 
@@ -101,26 +54,16 @@ func TestCleanAnswer_StripThoughtsAndFences(t *testing.T) {
 	}
 }
 
-// stripEnvelope 不得把整段内容切成空（v0.3.0 的 s[:0] 缺陷）
-func TestStripEnvelope_NoEmptyCut(t *testing.T) {
-	in := "```json\n{\"action\":\"completion\"}\n```"
-	if got := stripEnvelope(in); got != in {
-		// 允许被裁剪，但绝不允许因裁剪产生空串而丢失全部内容
-		if got == "" {
-			t.Errorf("stripEnvelope 把内容切成了空串")
-		}
-	}
-}
-
-// isDegraded 判定
+// isDegraded 只看协议结果是否为空；普通业务关键词不得触发
 func TestIsDegraded(t *testing.T) {
 	cases := []struct {
 		name, raw, cleaned, action string
 		want                       bool
 	}{
-		{"空输出", "anything", "", "completion", true},
-		{"含活动词", "Lighthouse 6 周年抽奖", "some answer", "completion", true},
-		{"开头即人设", "我是 OrcaTerm AI，云端服务器运维专家。答案。", "答案。", "completion", true},
+		{"空 completion", "anything", "", "completion", true},
+		{"review 可无正文", "", "", "review", false},
+		{"周年正文", "Lighthouse 6 周年抽奖", "some answer", "completion", false},
+		{"人设正文", "我是 OrcaTerm AI，云端服务器运维专家。", "答案。", "completion", false},
 		{"正常答案", "使用 df -h 查看磁盘。", "使用 df -h 查看磁盘。", "completion", false},
 	}
 	for _, c := range cases {

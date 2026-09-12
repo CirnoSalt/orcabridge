@@ -8,14 +8,17 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,31 +26,38 @@ import (
 	"time"
 )
 
-const proxyVersion = "0.8.0"
+const (
+	proxyVersion       = "0.8.0"
+	maxUpstreamBody    = 8 << 20
+	maxSSEEventData    = 1 << 20
+	maxUpstreamRawText = 8 << 20
+)
 
 // ===== 配置 =====
 
 // Config 代理配置。默认零配置：自动读取运行中的 OrcaTerm 的 .cookies 作为认证。
 type Config struct {
-	Port          string        // 监听端口（默认 localhost:8080）
-	Cookies       string        // OrcaTerm .cookies 文件路径
-	Upstream      string        // ligai 后端地址
-	AliasModel    string        // 兼容别名：该名字等价于"默认模型"（默认 orcaterm-assistant）
-	Product       string        // X-Product 头
-	Origin        string        // Origin 头
-	UserAgent     string        // User-Agent 头（默认模拟客户端真实 UA）
-	UpstreamModel string        // 默认模型的上游 id（默认 TokenHub/deepseek-v4-flash）
-	AllowUnknown  bool          // 是否允许未在目录中的模型 id 直通上游（默认否）
-	Timeouts      int           // 上游请求超时秒数
-	Mode          string        // structured：用非流式结构化响应（默认，干净）；raw-stream：直连 SSE
-	OnDegraded    string        // 退化输出处理：empty（默认，返回空）/ raw（返回清洗后原文）/ error
-	Prompt        string        // 追加在 input 前的用户级覆盖指令（可空禁用）
-	Strip         bool          // 是否启用清洗管线
-	HideTools     bool          // 是否要求上游隐藏工具消息（hideToolMessage 等三个开关）
-	SessionTTL    time.Duration // 会话空闲保活时长（默认 30 分钟）
-	SessionMax    int           // 会话表容量上限（默认 1000）
-	ToolsMode     string        // tools 处理：native（默认，上游原生工具透传）/ error / inject / ignore
-	ContextLimit  int           // 上下文上限，用于估算剩余量（默认 128000）
+	Port           string        // 监听端口（默认 localhost:8080）
+	Cookies        string        // OrcaTerm .cookies 文件路径
+	Upstream       string        // ligai 后端地址
+	AliasModel     string        // 兼容别名：该名字等价于"默认模型"（默认 orcaterm-assistant）
+	Product        string        // X-Product 头
+	Origin         string        // Origin 头
+	UserAgent      string        // User-Agent 头（默认模拟客户端真实 UA）
+	UpstreamModel  string        // 默认模型的上游 id（默认 TokenHub/deepseek-v4-flash）
+	AllowUnknown   bool          // 是否允许未在目录中的模型 id 直通上游（默认否）
+	Timeouts       int           // 上游请求超时秒数
+	Mode           string        // structured：用非流式结构化响应（默认，干净）；raw-stream：直连 SSE
+	OnDegraded     string        // 退化输出处理：empty（默认，返回空）/ raw（返回清洗后原文）/ error
+	Prompt         string        // 追加在 input 前的用户级覆盖指令（可空禁用）
+	Strip          bool          // 是否启用清洗管线
+	HideTools      bool          // 是否要求上游隐藏工具消息（hideToolMessage 等三个开关）
+	SessionTTL     time.Duration // 会话空闲保活时长（默认 30 分钟）
+	SessionMax     int           // 会话表容量上限（默认 1000）
+	ToolsMode      string        // tools 处理：native（默认，上游原生工具透传）/ error / inject / ignore
+	ContextLimit   int           // 上下文上限，用于估算剩余量（默认 128000）
+	CORSOrigins    []string      // 允许跨域访问的精确 Origin；空表示禁用 CORS；"*" 表示任意 Origin
+	ConfigWarnings []string      // 环境变量解析警告；validateConfig 会拒绝启动
 }
 
 // defaultPromptOverride 默认覆盖指令。
@@ -122,6 +132,13 @@ func loadConfig() Config {
 	if v := os.Getenv("ORCATERM_MODE"); v != "" {
 		c.Mode = strings.ToLower(strings.TrimSpace(v))
 	}
+	if v := os.Getenv("ORCATERM_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err != nil {
+			c.ConfigWarnings = append(c.ConfigWarnings, "ORCATERM_TIMEOUT must be an integer")
+		} else {
+			c.Timeouts = n
+		}
+	}
 	if v := os.Getenv("ORCATERM_ON_DEGRADED"); v != "" {
 		c.OnDegraded = strings.ToLower(strings.TrimSpace(v))
 	}
@@ -137,12 +154,16 @@ func loadConfig() Config {
 		c.HideTools = !(v == "0" || v == "off" || v == "false" || v == "no")
 	}
 	if v := os.Getenv("ORCATERM_SESSION_TTL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
+		if d, err := time.ParseDuration(v); err != nil {
+			c.ConfigWarnings = append(c.ConfigWarnings, "ORCATERM_SESSION_TTL must be a duration")
+		} else {
 			c.SessionTTL = d
 		}
 	}
 	if v := os.Getenv("ORCATERM_SESSION_MAX"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		if n, err := strconv.Atoi(v); err != nil {
+			c.ConfigWarnings = append(c.ConfigWarnings, "ORCATERM_SESSION_MAX must be an integer")
+		} else {
 			c.SessionMax = n
 		}
 	}
@@ -150,11 +171,89 @@ func loadConfig() Config {
 		c.ToolsMode = strings.ToLower(strings.TrimSpace(v))
 	}
 	if v := os.Getenv("ORCATERM_CONTEXT_LIMIT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		if n, err := strconv.Atoi(v); err != nil {
+			c.ConfigWarnings = append(c.ConfigWarnings, "ORCATERM_CONTEXT_LIMIT must be an integer")
+		} else {
 			c.ContextLimit = n
 		}
 	}
+	if v, ok := os.LookupEnv("ORCATERM_CORS_ORIGINS"); ok {
+		for _, raw := range strings.Split(v, ",") {
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				continue
+			}
+			origin, err := normalizeOrigin(raw)
+			if err != nil {
+				c.ConfigWarnings = append(c.ConfigWarnings, err.Error())
+				continue
+			}
+			c.CORSOrigins = append(c.CORSOrigins, origin)
+		}
+	}
 	return c
+}
+
+// normalizeOrigin 规范化 CORS Origin：只允许 http/https 的 scheme://host[:port]，或显式 "*"。
+// 尾部斜杠、路径、查询串与片段都会被拒绝，避免出现"看起来允许实际不匹配"的配置。
+func normalizeOrigin(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", nil
+	}
+	if s == "*" {
+		return "*", nil
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", fmt.Errorf("ORCATERM_CORS_ORIGINS entry %q is not a valid origin", s)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("ORCATERM_CORS_ORIGINS entry %q must use http or https", s)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("ORCATERM_CORS_ORIGINS entry %q is missing a host", s)
+	}
+	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("ORCATERM_CORS_ORIGINS entry %q must not include a path, query, or fragment", s)
+	}
+	return u.Scheme + "://" + u.Host, nil
+}
+
+func validateConfig(c Config) error {
+	if len(c.ConfigWarnings) > 0 {
+		return fmt.Errorf("invalid configuration: %s", strings.Join(c.ConfigWarnings, "; "))
+	}
+	if c.Mode != "structured" && c.Mode != "raw-stream" {
+		return fmt.Errorf("ORCATERM_MODE must be structured or raw-stream, got %q", c.Mode)
+	}
+	if c.ToolsMode != "native" && c.ToolsMode != "error" && c.ToolsMode != "inject" && c.ToolsMode != "ignore" {
+		return fmt.Errorf("ORCATERM_TOOLS_MODE must be native, error, inject, or ignore, got %q", c.ToolsMode)
+	}
+	if c.OnDegraded != "empty" && c.OnDegraded != "raw" && c.OnDegraded != "error" {
+		return fmt.Errorf("ORCATERM_ON_DEGRADED must be empty, raw, or error, got %q", c.OnDegraded)
+	}
+	if c.Timeouts <= 0 {
+		return fmt.Errorf("ORCATERM_TIMEOUT must be a positive number of seconds, got %d", c.Timeouts)
+	}
+	if c.SessionTTL <= 0 {
+		return fmt.Errorf("ORCATERM_SESSION_TTL must be a positive duration, got %s", c.SessionTTL)
+	}
+	if c.SessionMax <= 0 {
+		return fmt.Errorf("ORCATERM_SESSION_MAX must be positive, got %d", c.SessionMax)
+	}
+	if c.ContextLimit <= 0 {
+		return fmt.Errorf("ORCATERM_CONTEXT_LIMIT must be positive, got %d", c.ContextLimit)
+	}
+	for _, origin := range c.CORSOrigins {
+		if origin == "" {
+			continue
+		}
+		if _, err := normalizeOrigin(origin); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ===== 凭据：从 .cookies 读取（零配置、自动刷新）=====
@@ -329,62 +428,163 @@ type upstreamData struct {
 }
 
 type upstreamResp struct {
-	Code    int           `json:"code"`
+	Code    upstreamCode  `json:"code"`
 	Data    *upstreamData `json:"data"`
 	Message string        `json:"message"`
 }
 
-// reviewTool 返回上游本轮想调用的工具（action=review 且 tool.name 非空时）。
-func (r *upstreamResp) reviewTool() *UpstreamTool {
-	if r == nil || r.Data == nil || r.Data.Tool == nil {
+// upstreamCode 兼容上游把 code 写成数字或字符串两种形态。
+//
+// 实测（2026-09-12 真机）：成功响应是 `"code":0`（数字），
+// 而鉴权/业务失败是 `"code":"10050000"`（字符串）配 HTTP 200。
+// 早期用 int 建模会把"登录过期"变成 JSON 解析失败，对外报成协议错误。
+type upstreamCode int
+
+// upstreamCodeAuthExpired 上游 AccessToken 失效的业务码。
+const upstreamCodeAuthExpired = 10050000
+
+func (c *upstreamCode) UnmarshalJSON(b []byte) error {
+	trimmed := strings.TrimSpace(string(b))
+	if trimmed == "" || trimmed == "null" {
+		*c = 0
 		return nil
 	}
-	if strings.TrimSpace(r.Data.Tool.Name) == "" {
+	if trimmed[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		if s = strings.TrimSpace(s); s == "" {
+			*c = 0
+			return nil
+		}
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return fmt.Errorf("upstream code %q is not numeric", s)
+		}
+		*c = upstreamCode(n)
 		return nil
 	}
-	return r.Data.Tool
+	var n int
+	if err := json.Unmarshal(b, &n); err != nil {
+		return err
+	}
+	*c = upstreamCode(n)
+	return nil
 }
 
-// answer 从结构化响应中挑出应返回给调用方的文本与 action。
-// action: completion=已作答 / ask=模型在反问 / review=模型想调用工具（本代理无工具运行时）。
-func (r *upstreamResp) answer() (string, string) {
-	if r.Data == nil {
-		return "", ""
-	}
-	action := r.Data.Action
-	if t := strings.TrimSpace(r.Data.TaskCompletion); t != "" {
-		return t, action
-	}
-	if t := strings.TrimSpace(r.Data.Question); t != "" {
-		return t, action
-	}
-	return "", action
+func (c upstreamCode) MarshalJSON() ([]byte, error) { return json.Marshal(int(c)) }
+
+// UpstreamOutcome 是 structured/raw 两种传输统一产出的结果，供 handler 后续消费。
+type UpstreamOutcome struct {
+	HTTPStatus int
+	Code       int
+	Action     string
+	Text       string
+	Thinking   string
+	Tool       *UpstreamTool
+	Raw        string
 }
 
-func (r *upstreamResp) safeThinking() string {
-	if r.Data == nil {
-		return ""
+func (o *UpstreamOutcome) ToolCalls() []ToolCall {
+	if o == nil || o.Action != "review" {
+		return nil
 	}
-	return r.Data.Thinking
+	return ToolCallsFromUpstream(o.Tool)
+}
+
+func outcomeFromStructured(resp *upstreamResp, raw string) (*UpstreamOutcome, error) {
+	if resp == nil {
+		return nil, upstreamProtocolError("upstream response is nil")
+	}
+	if resp.Code != 0 {
+		return nil, upstreamBusinessError(int(resp.Code), resp.Message)
+	}
+	if resp.Data == nil {
+		return nil, upstreamProtocolError("upstream data is missing")
+	}
+	text, err := validateUpstreamData(resp.Data)
+	if err != nil {
+		return nil, err
+	}
+	return &UpstreamOutcome{
+		HTTPStatus: http.StatusOK,
+		Code:       int(resp.Code),
+		Action:     resp.Data.Action,
+		Text:       text,
+		Thinking:   resp.Data.Thinking,
+		Tool:       resp.Data.Tool,
+		Raw:        raw,
+	}, nil
+}
+
+func validateUpstreamData(data *upstreamData) (string, error) {
+	if data == nil {
+		return "", upstreamProtocolError("upstream data is missing")
+	}
+	switch data.Action {
+	case "completion":
+		if data.Tool != nil || strings.TrimSpace(data.TaskCompletion) == "" {
+			return "", upstreamProtocolError("invalid completion payload")
+		}
+		return data.TaskCompletion, nil
+	case "ask":
+		if data.Tool != nil || strings.TrimSpace(data.Question) == "" {
+			return "", upstreamProtocolError("invalid ask payload")
+		}
+		return data.Question, nil
+	case "review":
+		if err := validateUpstreamTool(data.Tool); err != nil {
+			return "", err
+		}
+		return "", nil
+	default:
+		return "", upstreamProtocolError("unsupported upstream action %q", data.Action)
+	}
+}
+
+func validateUpstreamTool(tool *UpstreamTool) error {
+	if tool == nil || strings.TrimSpace(tool.Name) == "" {
+		return upstreamProtocolError("review payload is missing tool name")
+	}
+	if !validToolArguments(tool.Args) {
+		return upstreamProtocolError("tool %q has invalid arguments", tool.Name)
+	}
+	return nil
 }
 
 // ===== 请求体结构 =====
 
 type ChatCompletionRequest struct {
-	Model     string        `json:"model"`
-	Messages  []ChatMessage `json:"messages"`
-	Stream    bool          `json:"stream"`
-	User      string        `json:"user"`       // OpenAI 标准字段，用作会话键
-	SessionID string        `json:"session_id"` // 可选的显式会话标识
-	Tools     []Tool        `json:"tools"`
+	Model             string          `json:"model"`
+	Messages          []ChatMessage   `json:"messages"`
+	Stream            bool            `json:"stream"`
+	StreamOptions     StreamOptions   `json:"stream_options"`
+	User              string          `json:"user"`
+	SessionID         string          `json:"session_id"`
+	Tools             []Tool          `json:"tools"`
+	Functions         []ToolFunction  `json:"functions"`
+	ToolChoice        json.RawMessage `json:"tool_choice"`
+	FunctionCall      json.RawMessage `json:"function_call"`
+	ParallelToolCalls *bool           `json:"parallel_tool_calls"`
+}
+
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
+type LegacyFunctionCall struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 type ChatMessage struct {
-	Role       string          `json:"role"`
-	Content    json.RawMessage `json:"content"`      // 字符串或多模态分部数组
-	ToolCalls  []ToolCall      `json:"tool_calls"`   // assistant 发起工具调用时携带
-	ToolCallID string          `json:"tool_call_id"` // role="tool" 时对应哪次调用
-	Name       string          `json:"name"`         // role="tool" 时为工具名
+	Role         string              `json:"role"`
+	Content      json.RawMessage     `json:"content"`
+	ToolCalls    []ToolCall          `json:"tool_calls"`
+	ToolCallID   string              `json:"tool_call_id"`
+	Name         string              `json:"name"`
+	FunctionCall *LegacyFunctionCall `json:"function_call"`
 }
 
 // ===== 代理服务器 =====
@@ -456,23 +656,35 @@ func (ps *ProxyServer) newConversationID() string {
 //     另有 type="start"、消息 id、files。
 //
 // 缺少这些时用户消息无法送达模型，上游会退化成输出自我介绍或活动卡片。
-func (ps *ProxyServer) chatBody(conversationID, input, userID, upstreamModel string, images []ContentPart, stream bool) map[string]interface{} {
+//
+// tools 策略只控制是否启用上游原生工具服务：setting.tools 始终为空，
+// 因为实测自定义 function 无法在上游注册（服务端系统提示词有最终裁决权）。
+func (ps *ProxyServer) chatBody(conversationID, input, userID, upstreamModel string, images []ContentPart, stream bool, policy toolPolicy) map[string]interface{} {
 	empty := []interface{}{}
+	mcpServers, uiServers := []string{}, []string{}
+	if policy.Enabled {
+		mcpServers = []string{"mcp-server-orcaterm-oauth"}
+		uiServers = []string{"ui-tools-orcaterm-explorer"}
+	}
+	setting := map[string]interface{}{
+		"mcpServers":                       mcpServers,
+		"uiServers":                        uiServers,
+		"tools":                            empty,
+		"approvedTools":                    empty,
+		"approvedMCPTools":                 empty,
+		"enableAutoSubtaskExecution":       false,
+		"env":                              empty,
+		"model":                            upstreamModel,
+		"modelDesc":                        map[string]interface{}{},
+		"hideToolMessage":                  ps.config.HideTools,
+		"isNormalToolMessageIgnored":       ps.config.HideTools,
+		"shouldHideDirectOutputToolReview": ps.config.HideTools,
+	}
 	return map[string]interface{}{
 		"conversationId": conversationID,
 		"user": map[string]interface{}{
-			"id": userID,
-			"setting": map[string]interface{}{
-				"mcpServers":                 []string{"mcp-server-orcaterm-oauth"},
-				"uiServers":                  []string{"ui-tools-orcaterm-explorer"},
-				"tools":                      empty,
-				"approvedTools":              empty,
-				"approvedMCPTools":           empty,
-				"enableAutoSubtaskExecution": false,
-				"env":                        empty,
-				"model":                      upstreamModel,
-				"modelDesc":                  map[string]interface{}{},
-			},
+			"id":      userID,
+			"setting": setting,
 		},
 		"input": map[string]interface{}{
 			"type":           "start",
@@ -485,23 +697,60 @@ func (ps *ProxyServer) chatBody(conversationID, input, userID, upstreamModel str
 	}
 }
 
-// callStructured 以 stream=false 调用上游，获取结构化 JSON（默认路径）。
-func (ps *ProxyServer) callStructured(ctx context.Context, creds Credentials, conversationID, input, upstreamModel string, images []ContentPart) (*upstreamResp, string, error) {
-	body, _ := json.Marshal(ps.chatBody(conversationID, input, creds.UserID, upstreamModel, images, false))
-	raw, err := ps.doChat(ctx, creds, body)
+// callStructured 以 stream=false 调用上游，并归一化为统一结果。
+func (ps *ProxyServer) callStructured(ctx context.Context, creds Credentials, conversationID, input, upstreamModel string, images []ContentPart, policy toolPolicy) (*UpstreamOutcome, error) {
+	body, _ := json.Marshal(ps.chatBody(conversationID, input, creds.UserID, upstreamModel, images, false, policy))
+	resp, err := ps.doChat(ctx, creds, body)
 	if err != nil {
-		return nil, "", err
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := readLimited(resp.Body, maxUpstreamBody)
+	if err != nil {
+		return nil, &UpstreamError{Status: resp.StatusCode, Op: "read upstream response", Err: err}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, upstreamHTTPError(resp.StatusCode, raw)
 	}
 	var parsed upstreamResp
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-		return nil, raw, fmt.Errorf("parse upstream json: %w", err)
+		return nil, upstreamProtocolError("parse upstream json: %v", err)
 	}
-	return &parsed, raw, nil
+	outcome, err := outcomeFromStructured(&parsed, raw)
+	if outcome != nil {
+		outcome.HTTPStatus = resp.StatusCode
+	}
+	return outcome, err
 }
 
-// callRawStream 以 stream=true 调用上游（低延迟路径，内容较脏）。
-func (ps *ProxyServer) callRawStream(ctx context.Context, creds Credentials, conversationID, input, upstreamModel string, images []ContentPart) (*http.Response, error) {
-	body, _ := json.Marshal(ps.chatBody(conversationID, input, creds.UserID, upstreamModel, images, true))
+// callRawStream 以 stream=true 调用上游并聚合 SSE，不直接写 ResponseWriter。
+func (ps *ProxyServer) callRawStream(ctx context.Context, creds Credentials, conversationID, input, upstreamModel string, images []ContentPart, policy toolPolicy) (*UpstreamOutcome, error) {
+	body, _ := json.Marshal(ps.chatBody(conversationID, input, creds.UserID, upstreamModel, images, true, policy))
+	req, err := ps.newChatRequest(ctx, creds, body)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := ps.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		raw, readErr := readLimited(resp.Body, maxUpstreamBody)
+		if readErr != nil {
+			return nil, &UpstreamError{Status: resp.StatusCode, Op: "read upstream error response", Err: readErr}
+		}
+		return nil, upstreamHTTPError(resp.StatusCode, raw)
+	}
+	outcome, err := ParseRawUpstream(resp.Body, maxSSEEventData, maxUpstreamRawText)
+	if outcome != nil {
+		outcome.HTTPStatus = resp.StatusCode
+	}
+	return outcome, err
+}
+
+// doChat 只负责发出请求；响应状态与有界读取由调用方统一检查。
+func (ps *ProxyServer) doChat(ctx context.Context, creds Credentials, body []byte) (*http.Response, error) {
 	req, err := ps.newChatRequest(ctx, creds, body)
 	if err != nil {
 		return nil, err
@@ -509,19 +758,95 @@ func (ps *ProxyServer) callRawStream(ctx context.Context, creds Credentials, con
 	return ps.client.Do(req)
 }
 
-func (ps *ProxyServer) doChat(ctx context.Context, creds Credentials, body []byte) (string, error) {
-	req, err := ps.newChatRequest(ctx, creds, body)
+type UpstreamError struct {
+	Status int
+	Op     string
+	Detail string
+	Err    error
+}
+
+func (e *UpstreamError) Error() string {
+	parts := []string{e.Op}
+	if e.Status != 0 {
+		parts = append(parts, fmt.Sprintf("HTTP %d", e.Status))
+	}
+	if e.Detail != "" {
+		parts = append(parts, truncate(e.Detail, 300))
+	}
+	if e.Err != nil {
+		parts = append(parts, e.Err.Error())
+	}
+	return strings.Join(parts, ": ")
+}
+
+func (e *UpstreamError) Unwrap() error { return e.Err }
+
+// errUpstreamProtocol 标记"上游协议损坏"（HTTP 200 但 JSON/包络不可解析或字段不合法）。
+var errUpstreamProtocol = errors.New("upstream protocol error")
+
+// errUpstreamAuth 标记上游认证失效。上游把 AccessToken 过期也走 HTTP 200 + 业务码，
+// 必须与"协议损坏"区分开，否则调用方只会看到一个含糊的错误。
+var errUpstreamAuth = errors.New("upstream authentication failed: AccessToken invalid or expired")
+
+// upstreamBusinessError 归类 HTTP 200 但 code != 0 的响应。
+func upstreamBusinessError(code int, message string) error {
+	msg := truncate(strings.TrimSpace(message), maxUpstreamErrorDetail)
+	if code == upstreamCodeAuthExpired || strings.Contains(strings.ToLower(msg), "invalid or expired accesstoken") {
+		return fmt.Errorf("%w (%s)", errUpstreamAuth, msg)
+	}
+	return fmt.Errorf("upstream code %d: %s", code, msg)
+}
+
+// upstreamProtocolError 包装协议类错误，便于 upstreamErrorResponse 归类。
+func upstreamProtocolError(format string, args ...interface{}) error {
+	return fmt.Errorf("%w: %s", errUpstreamProtocol, fmt.Sprintf(format, args...))
+}
+
+// maxUpstreamErrorDetail 上游错误正文在对外错误信息中保留的最大字符数。
+const maxUpstreamErrorDetail = 300
+
+func upstreamHTTPError(status int, body string) error {
+	return &UpstreamError{
+		Status: status,
+		Op:     "upstream request failed",
+		Detail: truncate(strings.TrimSpace(body), maxUpstreamErrorDetail),
+	}
+}
+
+// upstreamErrorResponse 把上游错误映射成对外 HTTP 状态与错误码。
+// 401/403 一律转成 502 upstream_auth_error，避免把上游认证问题误报为调用方未授权。
+func upstreamErrorResponse(err error) (int, string) {
+	var ue *UpstreamError
+	if errors.As(err, &ue) {
+		switch {
+		case ue.Status == http.StatusTooManyRequests:
+			return http.StatusTooManyRequests, "upstream_rate_limited"
+		case ue.Status == http.StatusUnauthorized || ue.Status == http.StatusForbidden:
+			return http.StatusBadGateway, "upstream_auth_error"
+		}
+	}
+	if errors.Is(err, errUpstreamAuth) {
+		return http.StatusBadGateway, "upstream_auth_error"
+	}
+	if errors.Is(err, errUpstreamProtocol) {
+		return http.StatusBadGateway, "upstream_protocol_error"
+	}
+	if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+		return http.StatusGatewayTimeout, "upstream_timeout"
+	}
+	return http.StatusBadGateway, "upstream_error"
+}
+
+func readLimited(r io.Reader, limit int) (string, error) {
+	if limit <= 0 {
+		return "", fmt.Errorf("invalid size limit %d", limit)
+	}
+	b, err := io.ReadAll(io.LimitReader(r, int64(limit)+1))
 	if err != nil {
 		return "", err
 	}
-	resp, err := ps.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
+	if len(b) > limit {
+		return "", fmt.Errorf("response exceeds %d bytes", limit)
 	}
 	return string(b), nil
 }
@@ -551,13 +876,31 @@ func (ps *ProxyServer) Handler() http.Handler {
 	mux.HandleFunc("/v1/sessions", ps.handleSessions)
 	mux.HandleFunc("/health", ps.handleHealth)
 	mux.HandleFunc("/debug/last", ps.handleDebugLast)
-	return corsMiddleware(mux)
+	return corsMiddleware(mux, ps.config.CORSOrigins)
+}
+
+// jwtExpiry 从 ot_session JWT 里读出 exp（不校验签名——只用于提前提示登录态是否过期）。
+func jwtExpiry(token string) (time.Time, bool) {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return time.Time{}, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}, false
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil || claims.Exp <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(claims.Exp, 0), true
 }
 
 func (ps *ProxyServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	creds, ok := ps.cookies.Get()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	out := map[string]interface{}{
 		"status":      "ok",
 		"version":     proxyVersion,
 		"has_sid":     creds.SID != "",
@@ -568,7 +911,15 @@ func (ps *ProxyServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"mode":        ps.config.Mode,
 		"on_degraded": ps.config.OnDegraded,
 		"strip":       ps.config.Strip,
-	})
+	}
+	// 上游把 AccessToken 过期也走 HTTP 200 + 业务码，代价是事发前完全看不出来。
+	// 这里本地解一次 JWT exp，让调用方能在请求失败前发现登录态需要刷新。
+	if exp, hasExp := jwtExpiry(creds.OT); hasExp {
+		out["token_expires_at"] = exp.UTC().Format(time.RFC3339)
+		out["token_expired"] = time.Now().After(exp)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
 }
 
 // handleDebugLast 返回最近一次上游原始响应与清洗结果，便于调参。
@@ -631,14 +982,8 @@ func (ps *ProxyServer) handleModels(w http.ResponseWriter, r *http.Request) {
 		items = append(items, modelEntry(m, created, m.ID == def.ID))
 	}
 	// 兼容别名：等价于默认模型，方便旧调用方继续使用
-	if a := strings.TrimSpace(ps.config.AliasModel); a != "" && a != def.ID {
-		items = append(items, map[string]interface{}{
-			"id": a, "object": "model", "created": created, "owned_by": "orcaterm",
-			"alias_of":   def.ID,
-			"upstream":   def.Upstream,
-			"name":       def.Name + " (alias)",
-			"deprecated": true,
-		})
+	if entry, ok := ps.aliasEntry(created); ok {
+		items = append(items, entry)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -657,8 +1002,9 @@ func (ps *ProxyServer) handleModels(w http.ResponseWriter, r *http.Request) {
 				"multimodal_image": true,                // 支持 image_url（data URI 或远程 URL）
 				"tools":            ps.config.ToolsMode, // native=上游原生工具透传
 				"tools_note": "native：上游自带的工具（fetch / 终端 / 云空间等）会以标准 OpenAI " +
-					"tool_calls 返回；调用方执行后把结果以 role=\"tool\" 回传即可，必须带同一个会话键。" +
-					"自定义 function 无法在上游注册，因此以调用方自己实现的原生工具名为准。",
+					"tool_calls 返回；调用方执行后把结果回传即可。现代格式只凭 tool_call_id 就能闭环，" +
+					"legacy role=\"function\" 结果必须复用原会话键。自定义 function 无法在上游注册，" +
+					"因此只能使用 OrcaTerm 原生工具名。",
 				"model_switch":      true,        // 传不同 model 即可切换上游模型
 				"usage":             "estimated", // 上游不返回 token，代理本地估算
 				"context_remaining": true,        // 通过响应头 X-OrcaTerm-Context-Remaining
@@ -691,6 +1037,24 @@ func modelEntry(m ModelInfo, created int64, isDefault bool) map[string]interface
 	return e
 }
 
+// aliasEntry 构造 deprecated 兼容别名的模型条目。
+// 当别名与默认模型 id 相同时返回 false——此时列表里不会出现独立条目，
+// 检索该 id 也应落到普通目录条目，保证 list/retrieve 一致。
+func (ps *ProxyServer) aliasEntry(created int64) (map[string]interface{}, bool) {
+	alias := strings.TrimSpace(ps.config.AliasModel)
+	def := ps.defaultModel()
+	if alias == "" || alias == def.ID {
+		return nil, false
+	}
+	return map[string]interface{}{
+		"id": alias, "object": "model", "created": created, "owned_by": "orcaterm",
+		"alias_of":   def.ID,
+		"upstream":   def.Upstream,
+		"name":       def.Name + " (alias)",
+		"deprecated": true,
+	}, true
+}
+
 // handleModelByID 支持 GET /v1/models/{id}（OpenAI 标准端点）。
 func (ps *ProxyServer) handleModelByID(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -698,6 +1062,14 @@ func (ps *ProxyServer) handleModelByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := strings.TrimPrefix(r.URL.Path, "/v1/models/")
+	created := time.Now().Unix()
+	if alias := strings.TrimSpace(ps.config.AliasModel); alias != "" && strings.EqualFold(strings.TrimSpace(id), alias) {
+		if entry, ok := ps.aliasEntry(created); ok {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(entry)
+			return
+		}
+	}
 	m, ok := FindModel(id)
 	if !ok {
 		writeOpenAIError(w, http.StatusNotFound, "invalid_request_error", "model_not_found",
@@ -705,7 +1077,194 @@ func (ps *ProxyServer) handleModelByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(modelEntry(m, time.Now().Unix(), m.ID == ps.defaultModel().ID))
+	json.NewEncoder(w).Encode(modelEntry(m, created, m.ID == ps.defaultModel().ID))
+}
+
+// toolPolicy 是调用方 tools/functions 声明经过校验后的规范化结果。
+type toolPolicy struct {
+	Tools   []Tool
+	Dialect string // modern（tools）/ legacy（functions）
+	Choice  string // auto / none
+	Enabled bool   // 是否向上游启用原生工具服务
+	Mode    string // 生效的 ORCATERM_TOOLS_MODE
+}
+
+// nativeToolNames 是 OrcaTerm 客户端实际注册的原生工具名。
+//
+// 取自客户端前端 bundle 的 V8 code cache 字符串表（EBWebView/Default/Code Cache/js），
+// 并用真机请求逐项验证：只声明 execute_terminal_command 时，上游会先请求
+// list_terminals，导致 "upstream requested undeclared tool" —— 说明终端类任务是
+// 一条工具链，客户端必须能一次性声明整条链路。
+//
+// 这些名字只用于**校验调用方的 tools 声明**：自定义 function 无法在上游注册，
+// 所以声明表外的名字一律拒绝。上游真正调用什么由服务端系统提示词决定。
+var nativeToolNames = map[string]bool{
+	// 网页抓取
+	"fetch": true,
+	// 终端与终端会话
+	"list_terminals":           true,
+	"get_terminal_detail":      true,
+	"get_terminal_output":      true,
+	"execute_terminal_command": true,
+	"send_terminal_signal":     true,
+	"list_connect_configs":     true,
+	"get_command_history":      true,
+	// 命令与后台任务
+	"execute_command":          true,
+	"create_command":           true,
+	"query_commands_status":    true,
+	"run_commands":             true,
+	"run_sandbox_task":         true,
+	"submit_agent_tasks":       true,
+	"query_agent_tasks_status": true,
+	// 云空间与远程文件
+	"read_cloud_space_file":      true,
+	"read_cloud_space_file_list": true,
+	"create_cloud_space_file":    true,
+	"remote_read":                true,
+	"remote_write":               true,
+	"remote_edit":                true,
+	"remote_multi_edit":          true,
+	"remote_glob":                true,
+	"remote_grep":                true,
+	// 设置与防火墙
+	"get_orcaterm_settings":    true,
+	"update_orcaterm_settings": true,
+	"create_firewall_rules":    true,
+	"delete_firewall_rules":    true,
+}
+
+// parseToolChoice 解析 tool_choice / function_call。
+// 只支持 "auto" 与 "none"；"required"、具名强制选择与任意对象都会得到明确错误。
+func parseToolChoice(raw json.RawMessage) (string, string, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return "auto", "", nil
+	}
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		return "", "forced_tool_choice_unsupported",
+			fmt.Errorf("named or forced tool selection is not supported")
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", "tool_choice_unsupported", fmt.Errorf("tool_choice must be a string")
+	}
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "auto", "":
+		return "auto", "", nil
+	case "none":
+		return "none", "", nil
+	case "required", "any":
+		return "", "tool_choice_required_unsupported",
+			fmt.Errorf("tool_choice %q is not supported because the upstream model decides tool use", value)
+	default:
+		return "", "forced_tool_choice_unsupported",
+			fmt.Errorf("forced tool choice %q is not supported", value)
+	}
+}
+
+// normalizeToolPolicy 校验 tools / functions 声明并归一化成一个策略。
+func normalizeToolPolicy(req *ChatCompletionRequest, mode string) (toolPolicy, string, error) {
+	if len(req.Tools) > 0 && len(req.Functions) > 0 {
+		return toolPolicy{}, "conflicting_tool_schemas",
+			fmt.Errorf("tools and functions cannot be used in the same request")
+	}
+	if req.ParallelToolCalls != nil && *req.ParallelToolCalls {
+		return toolPolicy{}, "parallel_tool_calls_unsupported",
+			fmt.Errorf("parallel_tool_calls is not supported; the upstream handles one pending call at a time")
+	}
+	p := toolPolicy{Tools: req.Tools, Dialect: "modern", Mode: mode}
+	choiceRaw := req.ToolChoice
+	if len(req.Functions) > 0 {
+		p.Dialect = "legacy"
+		p.Tools = make([]Tool, 0, len(req.Functions))
+		for _, fn := range req.Functions {
+			p.Tools = append(p.Tools, Tool{Type: "function", Function: fn})
+		}
+		choiceRaw = req.FunctionCall
+	}
+	choice, code, err := parseToolChoice(choiceRaw)
+	if err != nil {
+		return toolPolicy{}, code, err
+	}
+	p.Choice = choice
+	if mode == "error" && len(p.Tools) > 0 {
+		return toolPolicy{}, "tools_unsupported",
+			fmt.Errorf("tool requests are rejected because ORCATERM_TOOLS_MODE=error")
+	}
+	if mode == "native" {
+		seen := map[string]bool{}
+		for _, tool := range p.Tools {
+			name := strings.TrimSpace(tool.Function.Name)
+			if tool.Type != "" && tool.Type != "function" {
+				return toolPolicy{}, "custom_tools_unsupported",
+					fmt.Errorf("tool type %q is not supported", tool.Type)
+			}
+			if !nativeToolNames[name] {
+				return toolPolicy{}, "custom_tools_unsupported",
+					fmt.Errorf("custom tool %q cannot be registered upstream; supported names: %s",
+						name, strings.Join(nativeToolNameList(), ", "))
+			}
+			if seen[name] {
+				return toolPolicy{}, "duplicate_tool", fmt.Errorf("tool %q is declared more than once", name)
+			}
+			seen[name] = true
+		}
+	}
+	p.Enabled = len(p.Tools) > 0 && choice != "none" && mode == "native"
+	return p, "", nil
+}
+
+// nativeToolNameList 返回稳定的原生工具名列表（用于错误信息与文档一致性）。
+func nativeToolNameList() []string {
+	names := make([]string, 0, len(nativeToolNames))
+	for name := range nativeToolNames {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// sessionAcquireErrorCode 映射"获取会话租约"阶段的错误。
+// 它与工具调用错误不同：这里是调用方会话键与 conversation 不一致或请求被取消。
+func sessionAcquireErrorCode(err error) string {
+	switch {
+	case IsStoreError(err, StoreErrorMismatch):
+		return "session_mismatch"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return "request_cancelled"
+	default:
+		return storeErrorCode(err)
+	}
+}
+
+func storeErrorCode(err error) string {
+	switch {
+	case IsStoreError(err, StoreErrorUnknownCall):
+		return "unknown_tool_call_id"
+	case IsStoreError(err, StoreErrorConsumed):
+		return "tool_call_already_consumed"
+	case IsStoreError(err, StoreErrorExpired):
+		return "expired_tool_call_id"
+	case IsStoreError(err, StoreErrorMismatch):
+		return "tool_call_mismatch"
+	case IsStoreError(err, StoreErrorInFlight):
+		return "tool_call_in_flight"
+	default:
+		return "invalid_tool_call"
+	}
+}
+
+// inputPlanErrorCode 把内容解析错误映射成稳定的错误码。
+func inputPlanErrorCode(err error) string {
+	switch {
+	case errors.Is(err, errToolResultMissingID):
+		return "tool_call_id_required"
+	case errors.Is(err, errMultipleToolResults):
+		return "multiple_tool_results_unsupported"
+	default:
+		return "invalid_content"
+	}
 }
 
 func (ps *ProxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -718,247 +1277,190 @@ func (ps *ProxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Requ
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "invalid_json", "Invalid request: %v", err)
 		return
 	}
+	policy, code, err := normalizeToolPolicy(&req, ps.config.ToolsMode)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", code, "%v", err)
+		return
+	}
 	creds, ok := ps.cookies.Get()
 	if !ok {
-		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", "not_logged_in",
-			"%s", "OrcaTerm not logged in. Please sign into OrcaTerm first.")
+		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", "not_logged_in", "OrcaTerm not logged in. Please sign into OrcaTerm first.")
 		return
 	}
-
-	// ---- 模型解析：把对外 id 映射到上游 setting.model ----
 	model, err := ps.resolveModel(req.Model)
 	if err != nil {
-		writeOpenAIError(w, http.StatusNotFound, "invalid_request_error", "model_not_found",
-			"model %s not found; available: %s (set ORCATERM_ALLOW_UNKNOWN_MODEL=1 to pass through)",
-			err.Error(), strings.Join(ModelIDs(), ", "))
+		writeOpenAIError(w, http.StatusNotFound, "invalid_request_error", "model_not_found", "model %s not found; available: %s", err.Error(), strings.Join(ModelIDs(), ", "))
 		return
 	}
-
-	// ---- 会话选择：命中即复用上游 conversationId，从而获得多轮上下文 ----
 	key := sessionKeyOf(r.Header.Get("X-Session-Id"), req.User)
 	if key == "" {
 		key = req.SessionID
 	}
-	var sess *Session
-	var cid string
-	if key != "" {
-		if sess = ps.sessions.Get(key); sess == nil {
-			sess = ps.sessions.Create(key, ps.newConversationID())
-		}
-		cid = sess.CID
-		sess.Last = time.Now()
-		sess.Turns++
-	} else {
-		cid = ps.newConversationID() // 无会话标识：一次性请求，无上下文
-	}
-
-	// ---- 输入提取：识别"工具结果回传"轮次，否则按多轮/一次性规则取用户消息 ----
-	plan, err := extractInputPlan(req.Messages, sess != nil)
+	// 先探测是否是工具结果轮次：工具结果必须复用已有 conversation，不能新建会话。
+	probe, err := extractInputPlan(req.Messages, false)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "invalid_content", "parse content: %v", err)
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", inputPlanErrorCode(err), "%v", err)
 		return
+	}
+	var lease *Lease
+	var plan *InputPlan
+	committed := false
+	defer func() {
+		if lease != nil && !committed {
+			_ = lease.Rollback()
+		}
+	}()
+	if probe.IsToolResult {
+		result := probe.Results[0]
+		var pending PendingCall
+		if result.Legacy {
+			if key == "" {
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "legacy_function_result_requires_session",
+					"legacy role=\"function\" results carry no tool_call_id; reuse the X-Session-Id or user of the triggering request")
+				return
+			}
+			pending, err = ps.sessions.UniquePendingCall(key)
+			if err != nil {
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", storeErrorCode(err), "%v", err)
+				return
+			}
+			result.ToolCallID = pending.ID
+		}
+		lease, pending, err = ps.sessions.AcquireCall(r.Context(), result.ToolCallID, key)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", storeErrorCode(err), "%v", err)
+			return
+		}
+		if name := strings.TrimSpace(result.Name); name != "" && name != pending.Name {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "tool_result_name_mismatch",
+				"tool result name %q does not match pending tool %q", name, pending.Name)
+			return
+		}
+		plan = &InputPlan{
+			Text:         BuildToolResultPrompt(pending.Name, result.Content),
+			IsToolResult: true,
+			Results: []ToolResultMessage{{
+				ToolCallID: pending.ID, Name: pending.Name, Content: result.Content, Legacy: result.Legacy,
+			}},
+		}
+	} else {
+		cid := ps.newConversationID()
+		if key != "" {
+			snapshot, _ := ps.sessions.GetOrCreate(key, cid)
+			cid = snapshot.CID
+		}
+		lease, err = ps.sessions.Acquire(r.Context(), key, cid)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", sessionAcquireErrorCode(err), "%v", err)
+			return
+		}
+		// lease.Session 是拿到同一 CID 租约之后取得的快照，因此并发请求看到的也是
+		// 串行化之后的轮次：新建会话或上游尚无历史轮次时都按首轮处理，
+		// 必须发送完整 system + 初始历史。
+		multiTurn := key != "" && lease.Session.Turns > 0
+		plan, err = extractInputPlan(req.Messages, multiTurn)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", inputPlanErrorCode(err), "%v", err)
+			return
+		}
 	}
 	input, images := plan.Text, plan.Images
 	if strings.TrimSpace(input) == "" && len(images) == 0 {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "missing_messages", "no user message found")
 		return
 	}
-	// 工具结果回传必须落在同一个会话上：否则上游拿不到原会话上下文，
-	// 孤儿结果会被当作孤立文本，静默产出无意义回答。
-	if plan.IsToolResult && ps.config.ToolsMode == "native" {
-		if key == "" {
-			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "tool_result_without_session",
-				"a tool result must be sent with the same session (X-Session-Id / user) as the tool call")
-			return
-		}
-		if sess == nil || sess.PendingTool == "" {
-			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "no_pending_tool",
-				"session %q has no pending tool call; reuse the session key from the tool_calls response", key)
-			return
-		}
+	if ps.config.ToolsMode == "inject" && len(policy.Tools) > 0 {
+		input += ToolsInstruction(policy.Tools)
 	}
-
-	// ---- tools：默认走"上游原生工具透传"，见 content.go 顶部说明 ----
-	if len(req.Tools) > 0 {
-		switch ps.config.ToolsMode {
-		case "ignore":
-			// 忽略，正常问答
-		case "inject":
-			input += ToolsInstruction(req.Tools)
-		case "error":
-			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "tools_unsupported",
-				"ORCATERM_TOOLS_MODE=error rejects all tool requests; use the default 'native' mode")
-			return
-		default: // native
-			// 上游按 setting（uiServers/mcpServers）自带工具，无需额外声明
-		}
-	}
-
-	promptTokens := EstimateTokens(input)
-	turn := 0
-	if sess != nil {
-		promptTokens += sess.Tokens
-		turn = sess.Turns
-	}
-	// 回显调用方请求的模型名（OpenAI 行为）；未指定时回显解析结果
+	promptTokens := lease.Session.Tokens + EstimateTokens(input)
 	respModel := strings.TrimSpace(req.Model)
 	if respModel == "" {
 		respModel = model.ID
 	}
-	log.Printf("[INFO] chat session=%q turn=%d model=%s(%s) images=%d stream=%v toolResult=%v input=%s",
-		key, turn, model.ID, model.Upstream, len(images), req.Stream, plan.IsToolResult, truncate(input, 80))
-
+	var outcome *UpstreamOutcome
 	if ps.config.Mode == "raw-stream" {
-		nativeTools := len(req.Tools) > 0 && ps.config.ToolsMode == "native"
-		upstream, err := ps.callRawStream(r.Context(), creds, cid, input, model.Upstream, images)
-		if err != nil {
-			writeOpenAIError(w, http.StatusBadGateway, "api_error", "backend_unreachable", "backend request failed: %v", err)
-			return
-		}
-		defer upstream.Body.Close()
-		if req.Stream {
-			ps.forwardRawStream(w, upstream, respModel, nativeTools)
-		} else {
-			ps.forwardRawNonStream(w, upstream, respModel, nativeTools)
-		}
-		return
-	}
-
-	// structured 模式（默认）
-	parsed, raw, err := ps.callStructured(r.Context(), creds, cid, input, model.Upstream, images)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream_error", "upstream failed: %v", err)
-		return
-	}
-	text, action := parsed.answer()
-
-	// ---- 原生工具调用：action=review + data.tool 映射为 OpenAI tool_calls ----
-	var toolCalls []ToolCall
-	undeclared := false
-	nativeTools := len(req.Tools) > 0 && ps.config.ToolsMode == "native"
-	if nativeTools {
-		if up := parsed.reviewTool(); up != nil {
-			toolCalls = ToolCallsFromUpstream(up)
-			text = "" // review 轮没有正文，只有工具意图
-		}
-	}
-
-	cleaned := text
-	degraded := false
-	if len(toolCalls) > 0 {
-		cleaned = ""
+		outcome, err = ps.callRawStream(r.Context(), creds, lease.CID, input, model.Upstream, images, policy)
 	} else {
-		if ps.config.Strip {
-			cleaned = cleanAnswer(text)
-		}
-		degraded = isDegraded(text, cleaned, action)
+		outcome, err = ps.callStructured(r.Context(), creds, lease.CID, input, model.Upstream, images, policy)
 	}
-
-	// tools 模拟模式（legacy）：从正文中解析调用意图
-	if len(toolCalls) == 0 && len(req.Tools) > 0 && ps.config.ToolsMode == "inject" {
-		if tcs, rest := ExtractToolCalls(cleaned); len(tcs) > 0 {
-			toolCalls, cleaned = tcs, rest
-		}
-	}
-
-	completionTokens := EstimateTokens(cleaned)
-	if len(toolCalls) > 0 {
-		completionTokens = 0
-		for _, tc := range toolCalls {
-			completionTokens += EstimateTokens(tc.Function.Name) + EstimateTokens(tc.Function.Arguments)
-		}
-	}
-	usage := map[string]interface{}{
-		"prompt_tokens":     promptTokens,
-		"completion_tokens": completionTokens,
-		"total_tokens":      promptTokens + completionTokens,
-		"estimated":         true,
-	}
-	if sess != nil {
-		sess.Tokens = promptTokens + completionTokens
-	}
-
-	toolName := ""
-	if len(toolCalls) > 0 {
-		toolName = toolCalls[0].Function.Name
-	}
-	// 维护"待回传工具"状态：review 轮置位，工具结果轮清空
-	if sess != nil {
-		switch {
-		case toolName != "":
-			sess.PendingTool = toolName
-		case plan.IsToolResult:
-			sess.PendingTool = ""
-		}
-	}
-	ps.debugMu.Lock()
-	ps.lastRaw = raw
-	ps.lastClean = cleaned
-	ps.lastMeta = map[string]interface{}{
-		"action": action, "degraded": degraded, "code": parsed.Code,
-		"raw_len": len(text), "clean_len": len(cleaned),
-		"session": key, "turn": turn, "images": len(images), "tool_calls": len(toolCalls),
-		"model_id": model.ID, "model_upstream": model.Upstream,
-		"tool_name": toolName, "tool_result_turn": plan.IsToolResult,
-		"thinking": truncate(parsed.safeThinking(), 300),
-	}
-	ps.debugMu.Unlock()
-
-	if degraded {
-		log.Printf("[WARN] 上游输出退化 action=%s raw=%d clean=%d", action, len(text), len(cleaned))
-	}
-	if len(toolCalls) > 0 {
-		log.Printf("[INFO] 上游请求工具 %s args=%s", toolName, truncate(toolCalls[0].Function.Arguments, 120))
-		if len(req.Tools) > 0 && !declaresTool(req.Tools, toolName) {
-			undeclared = true
-			log.Printf("[WARN] 上游请求的工具 %q 不在调用方声明的 tools 中；调用方需自行实现或映射该名称", toolName)
-		}
-	}
-
-	out := cleaned
-	switch ps.config.OnDegraded {
-	case "raw":
-		// 保留清洗后原文
-	case "error":
-		if degraded {
-			writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream_degraded",
-				"upstream returned a persona/promotional message instead of an answer (action=%s)", action)
+	if err != nil {
+		status, errorCode := upstreamErrorResponse(err)
+		if errorCode == "upstream_auth_error" {
+			writeOpenAIError(w, status, "api_error", errorCode,
+				"OrcaTerm 登录态已失效，请在 OrcaTerm 客户端重新登录后重试（%v）", err)
 			return
 		}
-	default: // empty
-		if degraded {
+		writeOpenAIError(w, status, "api_error", errorCode, "upstream failed: %v", err)
+		return
+	}
+	text, action := outcome.Text, outcome.Action
+	toolCalls := outcome.ToolCalls()
+	if len(toolCalls) > 0 {
+		// 上游调用了调用方没有声明的工具：明确报错，并且不创建 pending call。
+		if !declaresTool(policy.Tools, toolCalls[0].Function.Name) {
+			writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream_requested_undeclared_tool",
+				"upstream requested undeclared tool %q; declare it in tools/functions or remove the tool schema", toolCalls[0].Function.Name)
+			return
+		}
+		text = ""
+	}
+	cleaned := text
+	if ps.config.Strip && len(toolCalls) == 0 {
+		cleaned = cleanAnswer(text)
+	}
+	if len(toolCalls) == 0 && ps.config.ToolsMode == "inject" && len(policy.Tools) > 0 {
+		toolCalls, cleaned = ExtractToolCalls(cleaned)
+	}
+	degraded := len(toolCalls) == 0 && isDegraded(text, cleaned, action)
+	out := cleaned
+	if degraded {
+		switch ps.config.OnDegraded {
+		case "error":
+			writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream_degraded", "upstream returned no valid answer")
+			return
+		case "empty":
 			out = ""
 		}
 	}
-
+	completionTokens := EstimateTokens(out)
+	for _, tc := range toolCalls {
+		completionTokens += EstimateTokens(tc.Function.Name) + EstimateTokens(tc.Function.Arguments)
+	}
+	total := promptTokens + completionTokens
+	usage := map[string]interface{}{"prompt_tokens": promptTokens, "completion_tokens": completionTokens, "total_tokens": total, "estimated": true}
+	var nextPending *PendingCall
+	if len(toolCalls) > 0 {
+		nextPending = &PendingCall{ID: toolCalls[0].ID, Name: toolCalls[0].Function.Name, Arguments: toolCalls[0].Function.Arguments}
+	}
+	if err := lease.Commit(1, total, nextPending); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "api_error", "session_commit_failed", "%v", err)
+		return
+	}
+	committed = true
+	ps.debugMu.Lock()
+	ps.lastRaw, ps.lastClean = outcome.Raw, cleaned
+	ps.lastMeta = map[string]interface{}{"action": action, "degraded": degraded, "session": key, "tool_calls": len(toolCalls), "model_id": model.ID}
+	ps.debugMu.Unlock()
 	w.Header().Set("X-OrcaTerm-Action", action)
 	w.Header().Set("X-OrcaTerm-Degraded", boolFlag(degraded))
 	w.Header().Set("X-OrcaTerm-Usage-Estimated", "1")
 	w.Header().Set("X-OrcaTerm-Model-Id", model.ID)
 	w.Header().Set("X-OrcaTerm-Model", model.Upstream)
-	if toolName != "" {
-		w.Header().Set("X-OrcaTerm-Tool", toolName)
-	}
-	if plan.IsToolResult {
-		w.Header().Set("X-OrcaTerm-Tool-Result-Turn", "1")
-	}
-	if undeclared {
-		w.Header().Set("X-OrcaTerm-Tool-Undeclared", "1")
-	}
-	total := promptTokens + completionTokens
 	if key != "" {
 		w.Header().Set("X-OrcaTerm-Session", key)
-		w.Header().Set("X-OrcaTerm-Turn", strconv.Itoa(turn))
+		w.Header().Set("X-OrcaTerm-Turn", strconv.Itoa(lease.Session.Turns+1))
 		w.Header().Set("X-OrcaTerm-Context-Used", strconv.Itoa(total))
 		w.Header().Set("X-OrcaTerm-Context-Limit", strconv.Itoa(ps.config.ContextLimit))
 		w.Header().Set("X-OrcaTerm-Context-Remaining", strconv.Itoa(maxInt(0, ps.config.ContextLimit-total)))
 	}
-
+	if plan.IsToolResult {
+		w.Header().Set("X-OrcaTerm-Tool-Result-Turn", "1")
+	}
 	if req.Stream {
-		ps.writeSyntheticStream(w, respModel, out, toolCalls, usage)
+		ps.writeSyntheticStream(w, respModel, out, toolCalls, usage, policy.Dialect, req.StreamOptions.IncludeUsage)
 		return
 	}
-	writeChatCompletionJSON(w, respModel, out, toolCalls, usage)
+	writeChatCompletionJSON(w, respModel, out, toolCalls, usage, policy.Dialect)
 }
 
 func boolFlag(b bool) string {
@@ -977,15 +1479,20 @@ func maxInt(a, b int) int {
 
 // ===== 输出构造 =====
 
-func writeChatCompletionJSON(w http.ResponseWriter, model, content string, toolCalls []ToolCall, usage map[string]interface{}) {
+func writeChatCompletionJSON(w http.ResponseWriter, model, content string, toolCalls []ToolCall, usage map[string]interface{}, dialect string) {
 	msg := map[string]interface{}{"role": "assistant", "content": content}
 	finish := "stop"
 	if len(toolCalls) > 0 {
-		msg["tool_calls"] = toolCalls
+		if dialect == "legacy" {
+			msg["function_call"] = map[string]string{"name": toolCalls[0].Function.Name, "arguments": toolCalls[0].Function.Arguments}
+			finish = "function_call"
+		} else {
+			msg["tool_calls"] = toolCalls
+			finish = "tool_calls"
+		}
 		if strings.TrimSpace(content) == "" {
 			msg["content"] = nil
 		}
-		finish = "tool_calls"
 	}
 	respBody := map[string]interface{}{
 		"id":      "chatcmpl-" + newUUID(),
@@ -1005,7 +1512,7 @@ func writeChatCompletionJSON(w http.ResponseWriter, model, content string, toolC
 
 // writeSyntheticStream 把已获得的答案本地切分为 SSE 流，兼容 OpenAI 流式客户端。
 // 末尾附带 usage（对应 OpenAI 的 stream_options.include_usage 语义）。
-func (ps *ProxyServer) writeSyntheticStream(w http.ResponseWriter, model, text string, toolCalls []ToolCall, usage map[string]interface{}) {
+func (ps *ProxyServer) writeSyntheticStream(w http.ResponseWriter, model, text string, toolCalls []ToolCall, usage map[string]interface{}, dialect string, includeUsage bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeOpenAIError(w, http.StatusInternalServerError, "api_error", "no_flusher", "streaming unsupported")
@@ -1020,6 +1527,8 @@ func (ps *ProxyServer) writeSyntheticStream(w http.ResponseWriter, model, text s
 
 	id := "chatcmpl-" + newUUID()
 	created := time.Now().Unix()
+	fmt.Fprintf(w, "data: {\"id\":%q,\"object\":\"chat.completion.chunk\",\"created\":%d,\"model\":%q,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n", id, created, model)
+	flusher.Flush()
 	emit := func(s string) {
 		if s == "" {
 			return
@@ -1031,416 +1540,263 @@ func (ps *ProxyServer) writeSyntheticStream(w http.ResponseWriter, model, text s
 	}
 	for _, c := range splitRunes(text, 3) {
 		emit(c)
-		time.Sleep(12 * time.Millisecond)
 	}
 	finish := "stop"
 	if len(toolCalls) > 0 {
-		if b, err := json.Marshal(toolCalls); err == nil {
-			chunk := fmt.Sprintf(`data: {"id":%q,"object":"chat.completion.chunk","created":%d,"model":%q,"choices":[{"index":0,"delta":{"tool_calls":%s},"finish_reason":null}]}`,
-				id, created, model, string(b))
-			fmt.Fprint(w, chunk+"\n\n")
-			flusher.Flush()
+		if dialect == "legacy" {
+			fc := map[string]string{"name": toolCalls[0].Function.Name, "arguments": toolCalls[0].Function.Arguments}
+			if b, err := json.Marshal(fc); err == nil {
+				fmt.Fprintf(w, "data: {\"id\":%q,\"object\":\"chat.completion.chunk\",\"created\":%d,\"model\":%q,\"choices\":[{\"index\":0,\"delta\":{\"function_call\":%s},\"finish_reason\":null}]}\n\n", id, created, model, b)
+			}
+			finish = "function_call"
+		} else {
+			indexed := make([]map[string]interface{}, 0, len(toolCalls))
+			for i, tc := range toolCalls {
+				indexed = append(indexed, map[string]interface{}{"index": i, "id": tc.ID, "type": tc.Type, "function": tc.Function})
+			}
+			if b, err := json.Marshal(indexed); err == nil {
+				fmt.Fprintf(w, "data: {\"id\":%q,\"object\":\"chat.completion.chunk\",\"created\":%d,\"model\":%q,\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":%s},\"finish_reason\":null}]}\n\n", id, created, model, b)
+			}
+			finish = "tool_calls"
 		}
-		finish = "tool_calls"
+		flusher.Flush()
 	}
 	end := fmt.Sprintf(`data: {"id":%q,"object":"chat.completion.chunk","created":%d,"model":%q,"choices":[{"index":0,"delta":{},"finish_reason":%q}]}`,
 		id, created, model, finish)
 	fmt.Fprint(w, end+"\n\n")
-	if b, err := json.Marshal(usage); err == nil {
-		fmt.Fprintf(w, "data: {\"id\":%q,\"object\":\"chat.completion.chunk\",\"model\":%q,\"choices\":[],\"usage\":%s}\n\n", id, model, string(b))
+	if includeUsage {
+		if b, err := json.Marshal(usage); err == nil {
+			fmt.Fprintf(w, "data: {\"id\":%q,\"object\":\"chat.completion.chunk\",\"created\":%d,\"model\":%q,\"choices\":[],\"usage\":%s}\n\n", id, created, model, string(b))
+		}
 	}
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }
 
-// ===== raw-stream 模式（保留，低延迟但内容较脏）=====
+// SSEEventReader 按 SSE 规范读取事件：空行分隔，多条 data 以换行拼接，兼容 CRLF 与 EOF 尾事件。
+type SSEEventReader struct {
+	r        *bufio.Reader
+	maxData  int
+	finished bool
+}
 
-func (ps *ProxyServer) forwardRawStream(w http.ResponseWriter, resp *http.Response, model string, nativeTools bool) {
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		writeOpenAIError(w, resp.StatusCode, "api_error", "upstream_error", "%s", truncate(string(body), 500))
-		return
-	}
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeOpenAIError(w, http.StatusInternalServerError, "api_error", "no_flusher", "streaming unsupported")
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
+func NewSSEEventReader(r io.Reader, maxData int) *SSEEventReader {
+	return &SSEEventReader{r: bufio.NewReader(r), maxData: maxData}
+}
 
-	id := "chatcmpl-" + newUUID()
-	created := time.Now().Unix()
-	emit := func(s string) {
-		if s == "" {
-			return
-		}
-		chunk := fmt.Sprintf(`data: {"id":%q,"object":"chat.completion.chunk","created":%d,"model":%q,"choices":[{"index":0,"delta":{"content":%s},"finish_reason":null}]}`,
-			id, created, model, jsonString(s))
-		fmt.Fprint(w, chunk+"\n\n")
-		flusher.Flush()
+// Next 返回下一条 data；done 表示收到 [DONE] 或输入正常结束。
+func (r *SSEEventReader) Next() (data string, done bool, err error) {
+	if r.finished {
+		return "", true, nil
 	}
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	var sp personaStripper
-	var env strings.Builder
-	var toolCalls []ToolCall
-	inEnvelope := false
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" {
-			continue
-		}
-		var frame struct {
-			Content string `json:"content"`
-			Type    string `json:"type"`
-		}
-		if json.Unmarshal([]byte(payload), &frame) != nil || frame.Type != "ai" || frame.Content == "" {
-			continue
-		}
-		if inEnvelope {
-			env.WriteString(frame.Content)
-			continue
-		}
-		if looksLikeEnvelope(frame.Content) {
-			inEnvelope = true
-			env.WriteString(frame.Content)
-			emit(sp.flush())
-			continue
-		}
-		if !ps.config.Strip {
-			emit(frame.Content)
-			continue
-		}
-		if out := sp.feed(frame.Content); out != "" {
-			emit(out)
-		}
+	if r.maxData <= 0 {
+		return "", false, fmt.Errorf("invalid SSE data limit %d", r.maxData)
 	}
-	if inEnvelope {
-		// 上游在流式模式把内部动作以 ```json 包络逐字吐出：提取工具调用或有正文
-		if nativeTools {
-			if up, ok := ParseReviewEnvelope(env.String()); ok {
-				toolCalls = ToolCallsFromUpstream(up)
-			}
-		}
-		if len(toolCalls) == 0 {
-			if parsed, ok := ParseChatEnvelope(env.String()); ok {
-				if t := strings.TrimSpace(parsed.TaskCompletion); t != "" {
-					emit(t)
-				} else if q := strings.TrimSpace(parsed.Question); q != "" {
-					emit(q)
+	var lines []string
+	size := 0
+	for {
+		line, readErr := r.r.ReadString('\n')
+		if len(line) > 0 {
+			line = strings.TrimSuffix(line, "\n")
+			line = strings.TrimSuffix(line, "\r")
+			if line == "" {
+				if len(lines) > 0 {
+					return r.finishEvent(lines)
+				}
+			} else if !strings.HasPrefix(line, ":") {
+				field, value := line, ""
+				if i := strings.IndexByte(line, ':'); i >= 0 {
+					field, value = line[:i], line[i+1:]
+					if strings.HasPrefix(value, " ") {
+						value = value[1:]
+					}
+				}
+				if field == "data" {
+					if len(lines) > 0 {
+						size++
+					}
+					size += len(value)
+					if size > r.maxData {
+						return "", false, fmt.Errorf("SSE event exceeds %d bytes", r.maxData)
+					}
+					lines = append(lines, value)
 				}
 			}
 		}
-	}
-	emit(sp.flush())
-	finish := "stop"
-	if len(toolCalls) > 0 {
-		if b, err := json.Marshal(toolCalls); err == nil {
-			chunk := fmt.Sprintf(`data: {"id":%q,"object":"chat.completion.chunk","created":%d,"model":%q,"choices":[{"index":0,"delta":{"tool_calls":%s},"finish_reason":null}]}`,
-				id, created, model, string(b))
-			fmt.Fprint(w, chunk+"\n\n")
-			flusher.Flush()
+		if readErr != nil {
+			if readErr != io.EOF {
+				return "", false, readErr
+			}
+			r.finished = true
+			if len(lines) > 0 {
+				return r.finishEvent(lines)
+			}
+			return "", true, nil
 		}
-		finish = "tool_calls"
 	}
-	end := fmt.Sprintf(`data: {"id":%q,"object":"chat.completion.chunk","created":%d,"model":%q,"choices":[{"index":0,"delta":{},"finish_reason":%q}]}`,
-		id, created, model, finish)
-	fmt.Fprint(w, end+"\n\n")
-	fmt.Fprint(w, "data: [DONE]\n\n")
-	flusher.Flush()
 }
 
-func (ps *ProxyServer) forwardRawNonStream(w http.ResponseWriter, resp *http.Response, model string, nativeTools bool) {
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		writeOpenAIError(w, resp.StatusCode, "api_error", "upstream_error", "%s", truncate(string(body), 500))
-		return
+func (r *SSEEventReader) finishEvent(lines []string) (string, bool, error) {
+	data := strings.Join(lines, "\n")
+	if strings.TrimSpace(data) == "[DONE]" {
+		r.finished = true
+		return "", true, nil
 	}
-	var sb strings.Builder
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" {
-			continue
-		}
-		var frame struct {
-			Content string `json:"content"`
-			Type    string `json:"type"`
-		}
-		if json.Unmarshal([]byte(payload), &frame) != nil || frame.Type != "ai" {
-			continue
-		}
-		sb.WriteString(frame.Content)
-	}
-	text := sb.String()
-	if nativeTools {
-		if up, ok := ParseReviewEnvelope(text); ok {
-			writeChatCompletionJSON(w, model, "", ToolCallsFromUpstream(up), nil)
-			return
-		}
-	}
-	if ps.config.Strip {
-		text = stripThoughts(text)
-		text = stripFencedJSON(text)
-		text = stripEnvelope(text)
-	}
-	writeChatCompletionJSON(w, model, strings.TrimSpace(text), nil, nil)
+	return data, false, nil
 }
+
+// ParseRawUpstream 聚合上游 SSE 的 ai 帧，并解析成与 structured 模式一致的结果。
+func ParseRawUpstream(r io.Reader, maxEventData, maxText int) (*UpstreamOutcome, error) {
+	if maxText <= 0 {
+		return nil, fmt.Errorf("invalid raw text limit %d", maxText)
+	}
+	reader := NewSSEEventReader(r, maxEventData)
+	var text strings.Builder
+	var raw strings.Builder
+	for {
+		data, done, err := reader.Next()
+		if err != nil {
+			return nil, fmt.Errorf("read upstream SSE: %w", err)
+		}
+		if done {
+			break
+		}
+		if data == "" {
+			continue
+		}
+		if raw.Len()+len(data)+1 > maxText {
+			return nil, fmt.Errorf("raw upstream payload exceeds %d bytes", maxText)
+		}
+		raw.WriteString(data)
+		raw.WriteByte('\n')
+		var frame struct {
+			Code    *upstreamCode   `json:"code"`
+			Message string          `json:"message"`
+			Content string          `json:"content"`
+			Type    string          `json:"type"`
+			Data    json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(data), &frame); err != nil {
+			return nil, upstreamProtocolError("parse upstream SSE data: %v", err)
+		}
+		if frame.Code != nil && *frame.Code != 0 {
+			return nil, upstreamBusinessError(int(*frame.Code), frame.Message)
+		}
+		if frame.Type == "ai" {
+			if text.Len()+len(frame.Content) > maxText {
+				return nil, upstreamProtocolError("raw upstream text exceeds %d bytes", maxText)
+			}
+			text.WriteString(frame.Content)
+		}
+	}
+	joined := text.String()
+	env, ok := ParseChatEnvelope(joined)
+	if !ok {
+		return nil, upstreamProtocolError("raw upstream response has no valid OrcaTerm envelope")
+	}
+	data := &upstreamData{
+		Action:         env.Action,
+		Thinking:       env.Thinking,
+		TaskCompletion: env.TaskCompletion,
+		Question:       env.Question,
+		Options:        env.Options,
+		Tool:           env.Tool,
+	}
+	answer, err := validateUpstreamData(data)
+	if err != nil {
+		return nil, err
+	}
+	return &UpstreamOutcome{
+		Code:     0,
+		Action:   data.Action,
+		Text:     answer,
+		Thinking: data.Thinking,
+		Tool:     data.Tool,
+		Raw:      raw.String(),
+	}, nil
+}
+
+// ===== raw-stream 模式（先完整解析上游，再由 handler 输出 OpenAI 响应）=====
 
 // ===== 清洗管线 =====
 
-var (
-	personaMarkers = []string{
-		"OrcaTerm AI", "OrcaTerm（遨驰终端）", "遨驰终端", "我是 OrcaTerm", "我是OrcaTerm",
-		"云端服务器运维专家", "云端服务器运维助手", "云端运维助手", "云端运维专家", "运维专家",
-	}
-	capabilityWords = []string{
-		"远程服务器", "远程连接", "远程登录", "命令执行", "执行命令", "文件操作", "文件读写",
-		"编辑文件", "搜索文件", "创建文件", "故障排查", "排查故障", "软件安装", "安装软件",
-		"软件部署", "服务部署", "部署服务", "配置修改", "配置服务", "服务启停", "启停服务",
-		"管理服务", "云产品", "云资源", "云资源管理", "批量操作", "TAT Agent", "性能诊断",
-		"系统监控", "状态监控", "系统诊断", "安全审计", "应用部署", "文档查询", "文档搜索",
-		"日志分析", "分析日志", "查看日志", "日志查看", "问题定位", "定位问题", "修复故障",
-		"错误定位", "自动化运维", "终端管理", "终端连接", "脚本运行", "运行脚本", "最佳实践",
-	}
-	activityWords = []string{
-		"周年", "抽奖", "玩法", "祝福", "Lighthouse", "活动规则", "邀请码", "开奖",
-		"送祝福", "选择你的故事", "云上故事", "你的故事", "活动页", "口令",
-		"轻量应用服务器六周年", "祝福方式", "分享邀请好友",
-	}
-	guidancePhrases = []string{
-		"请告诉我您需要", "请告诉我您的", "请告诉我您想要", "请直接告诉我", "请告诉我",
-		"请问您需要", "您需要什么帮助", "需要什么帮助", "请提供", "请描述您",
-		"有什么可以帮", "我会立即", "我会尽力", "随时为您", "等待您提出",
-		// 能力清单的引导句（"您可以通过我完成以下工作："）
-		"以下工作", "服务范围", "核心能力", "以下方面", "您可以完成", "能为您完成",
-	}
-)
-
-func containsAny(hay string, needles []string) bool {
-	for _, n := range needles {
-		if strings.Contains(hay, n) {
-			return true
-		}
-	}
-	return false
-}
-
-// stripThoughts 去掉 <think>…</think> 思考段。
+// stripThoughts 只剥离 fence 外闭合的 <think>…</think>；未闭合内容原样保留。
 func stripThoughts(s string) string {
-	for {
-		start := strings.Index(s, "<think>")
-		if start < 0 {
-			return s
-		}
-		end := strings.Index(s[start:], "</think>")
-		if end < 0 {
-			return strings.TrimSpace(s[:start])
-		}
-		s = s[:start] + s[start+end+len("</think>"):]
-	}
-}
-
-// stripFencedJSON 去掉所有 ```…``` 围栏块（上游的内部动作/技能包络都长这样）。
-func stripFencedJSON(s string) string {
 	var out strings.Builder
-	inFence := false
-	for _, ln := range strings.Split(s, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(ln), "```") {
-			inFence = !inFence
-			continue
-		}
-		if !inFence {
-			out.WriteString(ln)
-			out.WriteString("\n")
+	for pos := 0; pos < len(s); {
+		fence := strings.Index(s[pos:], "```")
+		think := strings.Index(s[pos:], "<think>")
+		switch {
+		case think < 0:
+			out.WriteString(s[pos:])
+			return out.String()
+		case fence >= 0 && fence < think:
+			fenceStart := pos + fence
+			out.WriteString(s[pos:fenceStart])
+			closeRel := strings.Index(s[fenceStart+3:], "```")
+			if closeRel < 0 {
+				out.WriteString(s[fenceStart:])
+				return out.String()
+			}
+			fenceEnd := fenceStart + 3 + closeRel + 3
+			out.WriteString(s[fenceStart:fenceEnd])
+			pos = fenceEnd
+		default:
+			start := pos + think
+			endRel := strings.Index(s[start+len("<think>"):], "</think>")
+			if endRel < 0 {
+				out.WriteString(s[pos:])
+				return out.String()
+			}
+			out.WriteString(s[pos:start])
+			pos = start + len("<think>") + endRel + len("</think>")
 		}
 	}
 	return out.String()
 }
 
-// isListLine 判断是否为列表项（- / * / • / 数字. 开头）。
-func isListLine(t string) bool {
-	if strings.HasPrefix(t, "- ") || strings.HasPrefix(t, "* ") || strings.HasPrefix(t, "• ") {
-		return true
-	}
-	if len(t) > 2 && t[0] >= '0' && t[0] <= '9' && (t[1] == '.' || t[1] == ')') {
-		return true
-	}
-	return false
-}
-
-// isNoiseLine 判断一行是否属于"人设/营销/菜单"噪音。
-func isNoiseLine(line string) bool {
-	t := strings.TrimSpace(line)
-	if t == "" {
-		return false
-	}
-	if containsAny(t, activityWords) {
-		return true
-	}
-	if strings.Contains(t, "我是") && containsAny(t, personaMarkers) {
-		return true
-	}
-	if strings.HasPrefix(t, "我可以") || strings.HasPrefix(t, "我能") ||
-		strings.HasPrefix(t, "我能够") || strings.HasPrefix(t, "我支持") ||
-		strings.HasPrefix(t, "我协助") {
-		if containsAny(t, []string{"帮", "协助", "支持", "提供", "完成", "处理"}) && len([]rune(t)) < 120 {
-			return true
+// stripFencedJSON 只剥离严格可信的 OrcaTerm completion/ask/review JSON 围栏。
+func stripFencedJSON(s string) string {
+	var out strings.Builder
+	for pos := 0; pos < len(s); {
+		i, prefixLen := nextJSONFence(s, pos)
+		if i < 0 {
+			out.WriteString(s[pos:])
+			break
 		}
+		out.WriteString(s[pos:i])
+		bodyStart := i + prefixLen
+		closeRel := strings.Index(s[bodyStart:], "```")
+		if closeRel < 0 {
+			out.WriteString(s[i:])
+			break
+		}
+		close := bodyStart + closeRel
+		blockEnd := close + 3
+		block := s[i:blockEnd]
+		if _, ok := ParseChatEnvelope(block); !ok {
+			out.WriteString(block)
+		}
+		pos = blockEnd
 	}
-	if isListLine(t) && containsAny(t, capabilityWords) {
-		return true
-	}
-	if containsAny(t, guidancePhrases) && len([]rune(t)) < 100 {
-		return true
-	}
-	if strings.HasPrefix(t, "#") && (containsAny(t, activityWords) || containsAny(t, personaMarkers)) {
-		return true
-	}
-	return false
+	return out.String()
 }
 
-// cleanAnswer 行级清洗：剔除人设、能力罗列、活动营销、选择菜单与收尾引导语。
-// 若检测到活动/营销上下文，则进入激进模式：连编号选项行一并丢弃，避免菜单残留。
+// cleanAnswer 仅做协议级清洗：保留普通 Markdown、列表、运维/周年文本，
+// 只删除 fence 外闭合 think 与严格可信的 OrcaTerm 动作包络。
 func cleanAnswer(s string) string {
 	s = stripThoughts(s)
 	s = stripFencedJSON(s)
-	aggressive := containsAny(s, activityWords)
-	lines := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
-	kept := make([]string, 0, len(lines))
-	for _, ln := range lines {
-		if isNoiseLine(ln) {
-			continue
-		}
-		if aggressive && isListLine(strings.TrimSpace(ln)) {
-			continue
-		}
-		kept = append(kept, ln)
-	}
-	out := strings.TrimSpace(strings.Join(kept, "\n"))
-	for strings.Contains(out, "\n\n\n") {
-		out = strings.ReplaceAll(out, "\n\n\n", "\n\n")
-	}
-	return out
-}
-
-// isDegraded 判断本轮上游是否"退化"（未给出有效答案）。
-func isDegraded(raw, cleaned, action string) bool {
-	if strings.TrimSpace(cleaned) == "" {
-		return true
-	}
-	if containsAny(raw, activityWords) {
-		return true
-	}
-	head := raw
-	if len([]rune(head)) > 120 {
-		head = string([]rune(head)[:120])
-	}
-	if containsAny(head, personaMarkers) {
-		return true
-	}
-	if action == "review" && strings.TrimSpace(cleaned) == "" {
-		return true
-	}
-	return false
-}
-
-// looksLikeEnvelope 判断流式片段是否进入上游内部动作 JSON 包络。
-func looksLikeEnvelope(s string) bool {
-	t := strings.TrimSpace(s)
-	if strings.HasPrefix(t, "```") {
-		return true
-	}
-	return strings.HasPrefix(t, "{") &&
-		(strings.Contains(t, "\"action\"") || strings.Contains(t, "taskCompletion") || strings.Contains(t, "\"tool\""))
-}
-
-// stripEnvelope 剥离聚合正文尾部的平衡 JSON 对象（已修复 s[:0] 切空的缺陷）。
-func stripEnvelope(s string) string {
-	s = strings.TrimSpace(s)
-	if i := strings.LastIndex(s, "```json"); i > 0 {
-		if cut := strings.TrimSpace(s[:i]); cut != "" {
-			return cut
-		}
-	}
-	if !strings.HasSuffix(s, "}") {
-		return s
-	}
-	for i := len(s) - 1; i > 0; i-- {
-		if s[i] == '{' {
-			var probe interface{}
-			if json.Unmarshal([]byte(s[i:]), &probe) == nil {
-				if cut := strings.TrimSpace(s[:i]); cut != "" {
-					return cut
-				}
-			}
-		}
-	}
 	return strings.TrimSpace(s)
 }
 
-// personaStripper 流式人设前导剥离（raw-stream 模式使用）。
-type personaStripper struct {
-	head   strings.Builder
-	active bool
-	done   bool
-}
-
-func (p *personaStripper) feed(s string) string {
-	if p.done {
-		return s
+// isDegraded 只依据协议有效性判定，避免把正常业务关键词误判为退化输出。
+func isDegraded(raw, cleaned, action string) bool {
+	_ = raw
+	if strings.TrimSpace(cleaned) != "" {
+		return false
 	}
-	p.head.WriteString(s)
-	h := p.head.String()
-	if !p.active {
-		if containsAny(h, personaMarkers) {
-			p.active = true
-			return ""
-		}
-		if p.head.Len() > 40 || strings.ContainsAny(h, "\n") {
-			out := h
-			p.head.Reset()
-			p.done = true
-			return out
-		}
-		return ""
-	}
-	if strings.Contains(h, "需要什么帮助") || strings.Contains(h, "请告诉我") {
-		p.head.Reset()
-		p.done = true
-		return ""
-	}
-	if p.head.Len() > 800 {
-		out := h
-		p.head.Reset()
-		p.done = true
-		return out
-	}
-	return ""
-}
-
-func (p *personaStripper) flush() string {
-	if p.done {
-		return ""
-	}
-	out := strings.TrimSpace(p.head.String())
-	p.head.Reset()
-	p.done = true
-	return out
+	return action != "review"
 }
 
 // ===== 工具函数 =====
@@ -1527,18 +1883,58 @@ func writeOpenAIError(w http.ResponseWriter, status int, errType, code, format s
 	json.NewEncoder(w).Encode(resp)
 }
 
-func corsMiddleware(next http.Handler) http.Handler {
+// corsAllowedHeaders 允许的请求头。X-Session-Id 是代理自定义的会话键，必须显式许可。
+const corsAllowedHeaders = "Content-Type, Authorization, X-Session-Id, OpenAI-Organization, OpenAI-Project, OpenAI-Beta"
+
+// corsExposedHeaders 浏览器可读的自定义响应头。
+const corsExposedHeaders = "X-OrcaTerm-Action, X-OrcaTerm-Degraded, X-OrcaTerm-Session, X-OrcaTerm-Turn, " +
+	"X-OrcaTerm-Context-Used, X-OrcaTerm-Context-Limit, X-OrcaTerm-Context-Remaining, " +
+	"X-OrcaTerm-Usage-Estimated, X-OrcaTerm-Tool-Result-Turn, X-OrcaTerm-Model, X-OrcaTerm-Model-Id"
+
+// corsMiddleware 按 allowlist 处理跨域。
+//
+// 默认（origins 为空）完全不返回 CORS 许可头；只有显式配置的 origin 才会被允许，
+// 且必须显式配置 "*" 才允许任意 origin。未允许 origin 的预检返回 403。
+func corsMiddleware(next http.Handler, origins []string) http.Handler {
+	allowAll := false
+	allowed := make(map[string]bool, len(origins))
+	for _, o := range origins {
+		switch o = strings.TrimSpace(o); o {
+		case "":
+			continue
+		case "*":
+			allowAll = true
+		default:
+			allowed[o] = true
+		}
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Expose-Headers",
-			"X-OrcaTerm-Action, X-OrcaTerm-Degraded, X-OrcaTerm-Session, X-OrcaTerm-Turn, "+
-				"X-OrcaTerm-Context-Used, X-OrcaTerm-Context-Limit, X-OrcaTerm-Context-Remaining, "+
-				"X-OrcaTerm-Usage-Estimated, X-OrcaTerm-Tool, X-OrcaTerm-Tool-Result-Turn, X-OrcaTerm-Tool-Undeclared, "+
-				"X-OrcaTerm-Model, X-OrcaTerm-Model-Id")
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		preflight := r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != ""
+		allowOrigin := ""
+		if origin != "" {
+			switch {
+			case allowAll:
+				allowOrigin = "*"
+			case allowed[origin]:
+				allowOrigin = origin
+			}
+		}
+		if allowOrigin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", allowOrigin)
+			w.Header().Add("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", corsAllowedHeaders)
+			w.Header().Set("Access-Control-Expose-Headers", corsExposedHeaders)
+			w.Header().Set("Access-Control-Max-Age", "600")
+		}
 		if r.Method == http.MethodOptions {
-			w.WriteHeader(200)
+			if allowOrigin == "" && (preflight || (origin != "" && r.Header.Get("Access-Control-Request-Headers") != "")) {
+				writeOpenAIError(w, http.StatusForbidden, "invalid_request_error", "cors_origin_denied",
+					"origin %q is not allowed by ORCATERM_CORS_ORIGINS", origin)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -1550,6 +1946,9 @@ func corsMiddleware(next http.Handler) http.Handler {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	config := loadConfig()
+	if err := validateConfig(config); err != nil {
+		log.Fatalf("[FATAL] %v", err)
+	}
 	server := NewProxyServer(config)
 
 	addr := "localhost:" + config.Port
@@ -1563,6 +1962,10 @@ func main() {
 		log.Printf("[INFO] Mode: %s, on_degraded: %s", config.Mode, config.OnDegraded)
 		creds, ok := server.cookies.Get()
 		log.Printf("[INFO] 凭据: %v (sid=%v ot=%v)", ok, creds.SID != "", creds.OT != "")
+		if exp, hasExp := jwtExpiry(creds.OT); hasExp && time.Now().After(exp) {
+			log.Printf("[WARN] OrcaTerm 登录态已过期（%s）。上游会用 HTTP 200 + code=10050000 拒绝请求，"+
+				"请在 OrcaTerm 客户端重新登录后再使用。", exp.Local().Format(time.RFC3339))
+		}
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[FATAL] %v", err)
 		}
