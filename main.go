@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	proxyVersion       = "0.8.0"
+	proxyVersion       = "0.9.0"
 	maxUpstreamBody    = 8 << 20
 	maxSSEEventData    = 1 << 20
 	maxUpstreamRawText = 8 << 20

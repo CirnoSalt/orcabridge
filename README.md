@@ -24,7 +24,7 @@
 正常日志示例：
 
 ```text
-[INFO] OrcaTerm AI Proxy v0.8.0 starting on http://localhost:8080
+[INFO] OrcaTerm AI Proxy v0.9.0 starting on http://localhost:8080
 [INFO] 凭据: true (sid=true ot=true)
 ```
 
