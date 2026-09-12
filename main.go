@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	proxyVersion       = "0.9.0"
+	proxyVersion       = "0.10.0"
 	maxUpstreamBody    = 8 << 20
 	maxSSEEventData    = 1 << 20
 	maxUpstreamRawText = 8 << 20
@@ -54,7 +54,8 @@ type Config struct {
 	HideTools      bool          // 是否要求上游隐藏工具消息（hideToolMessage 等三个开关）
 	SessionTTL     time.Duration // 会话空闲保活时长（默认 30 分钟）
 	SessionMax     int           // 会话表容量上限（默认 1000）
-	ToolsMode      string        // tools 处理：native（默认，上游原生工具透传）/ error / inject / ignore
+	ToolsMode      string        // tools 处理：pass（默认，接受任意声明）/ native（严格）/ error / inject / ignore
+	Bridge         string        // 工具桥接：off / safe（默认）/ all，见 clientToolBridge
 	ContextLimit   int           // 上下文上限，用于估算剩余量（默认 128000）
 	CORSOrigins    []string      // 允许跨域访问的精确 Origin；空表示禁用 CORS；"*" 表示任意 Origin
 	ConfigWarnings []string      // 环境变量解析警告；validateConfig 会拒绝启动
@@ -102,6 +103,7 @@ func loadConfig() Config {
 		SessionTTL:    30 * time.Minute,
 		SessionMax:    1000,
 		ToolsMode:     toolsModePass,
+		Bridge:        bridgeSafe,
 		ContextLimit:  128000,
 	}
 	if v := os.Getenv("PROXY_PORT"); v != "" {
@@ -169,6 +171,9 @@ func loadConfig() Config {
 	}
 	if v := os.Getenv("ORCATERM_TOOLS_MODE"); v != "" {
 		c.ToolsMode = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := os.Getenv("ORCATERM_TOOLS_BRIDGE"); v != "" {
+		c.Bridge = strings.ToLower(strings.TrimSpace(v))
 	}
 	if v := os.Getenv("ORCATERM_CONTEXT_LIMIT"); v != "" {
 		if n, err := strconv.Atoi(v); err != nil {
@@ -1102,6 +1107,21 @@ const (
 	toolsModeNative = "native"
 )
 
+// 工具桥接级别（ORCATERM_TOOLS_BRIDGE）。
+//
+//   - off：不桥接。客户端声明的外来工具依旧只是被记录为 Unsupported。
+//   - safe（默认）：只桥接两侧语义等价的那几对（Bash↔execute_command、WebFetch↔fetch）。
+//   - all：再加作用于**远端主机**的文件/搜索类（Read↔remote_read、Write↔remote_write、
+//     Grep↔remote_grep）。上游自己的描述里写的是"远程服务器"，与调用方本地文件系统
+//     不是一回事，所以要显式开启。
+//
+// 级别的含义见 bridgeAllows 与 clientToolBridge 的 Risk 字段。
+const (
+	bridgeOff  = "off"
+	bridgeSafe = "safe"
+	bridgeAll  = "all"
+)
+
 // toolPolicy 是调用方 tools/functions 声明经过校验后的规范化结果。
 type toolPolicy struct {
 	Tools   []Tool
@@ -1111,6 +1131,14 @@ type toolPolicy struct {
 	Mode    string // 生效的 ORCATERM_TOOLS_MODE
 	// Unsupported 是调用方声明了、但 OrcaTerm 上游没有的工具名（保序去重）。
 	Unsupported []string
+	// Bridged 是"客户端工具名 -> 可承接的 OrcaTerm 原生工具名"，只含本请求实际声明
+	// 且在当前桥接级别下允许的那些。它决定了上游原生服务是否开启、以及原生调用
+	// 要改名叫什么。
+	Bridged map[string]string
+	// BridgeNative 是 Bridged 的反查表：原生工具名 -> 客户端工具名。
+	BridgeNative map[string]string
+	// BridgeLevel 是本请求生效的桥接级别（off / safe / all）。
+	BridgeLevel string
 }
 
 // nativeToolNames 是可声明的 OrcaTerm 原生工具名。
@@ -1218,7 +1246,7 @@ func parseToolChoice(raw json.RawMessage) (string, string, error) {
 }
 
 // normalizeToolPolicy 校验 tools / functions 声明并归一化成一个策略。
-func normalizeToolPolicy(req *ChatCompletionRequest, mode string) (toolPolicy, string, error) {
+func normalizeToolPolicy(req *ChatCompletionRequest, mode string, bridge string) (toolPolicy, string, error) {
 	if len(req.Tools) > 0 && len(req.Functions) > 0 {
 		return toolPolicy{}, "conflicting_tool_schemas",
 			fmt.Errorf("tools and functions cannot be used in the same request")
@@ -1244,7 +1272,11 @@ func normalizeToolPolicy(req *ChatCompletionRequest, mode string) (toolPolicy, s
 	}
 	// 重复声明在任何模式下都是调用方的笔误，直接拒绝。
 	seen := map[string]bool{}
+	declaredNative := map[string]bool{}
 	nativeCount := 0
+	bridgeCount := 0
+	p.BridgeLevel = bridge
+	p.Bridged, p.BridgeNative = map[string]string{}, map[string]string{}
 	for _, tool := range p.Tools {
 		name := strings.TrimSpace(tool.Function.Name)
 		if seen[name] {
@@ -1257,10 +1289,16 @@ func normalizeToolPolicy(req *ChatCompletionRequest, mode string) (toolPolicy, s
 		}
 		if nativeToolNames[name] {
 			nativeCount++
+			declaredNative[name] = true
 			continue
 		}
 		if name == "" {
 			return toolPolicy{}, "custom_tools_unsupported", fmt.Errorf("tool name must not be empty")
+		}
+		if entry, ok := BridgeEntryFor(name, bridge); ok {
+			p.Bridged[name] = entry.Native
+			bridgeCount++
+			continue
 		}
 		if mode == toolsModeNative {
 			return toolPolicy{}, "custom_tools_unsupported",
@@ -1269,10 +1307,38 @@ func normalizeToolPolicy(req *ChatCompletionRequest, mode string) (toolPolicy, s
 		}
 		p.Unsupported = append(p.Unsupported, name)
 	}
-	// 只在调用方确实声明了原生工具时才启用上游原生工具服务：
+	// 原生名被直接声明时按原生透传，不再改名——调用方显然知道自己在要什么。
+	for client, nativeName := range p.Bridged {
+		if declaredNative[nativeName] {
+			delete(p.Bridged, client)
+			bridgeCount--
+			continue
+		}
+		if _, exists := p.BridgeNative[nativeName]; !exists {
+			p.BridgeNative[nativeName] = client
+		}
+	}
+	// 只在"调用方能承接"时才启用上游原生工具服务：
+	// 能承接 = 声明了原生工具，或声明了可桥接的客户端工具。
 	// 否则上游可能返回调用方无法执行的工具调用，反而把一轮对话变成硬错误。
-	p.Enabled = nativeCount > 0 && choice != "none" && (mode == toolsModePass || mode == toolsModeNative)
+	p.Enabled = (nativeCount+bridgeCount) > 0 && choice != "none" &&
+		(mode == toolsModePass || mode == toolsModeNative)
 	return p, "", nil
+}
+
+// bridgeClientFor 找出本请求里能承接该原生调用的客户端工具名。
+// 按 tools 声明顺序取第一个，保证同名多个候选时行为确定。
+func (p toolPolicy) bridgeClientFor(native string) (string, toolBridgeEntry, bool) {
+	for _, t := range p.Tools {
+		name := strings.TrimSpace(t.Function.Name)
+		if p.Bridged[name] != native {
+			continue
+		}
+		if entry, ok := BridgeEntryFor(name, p.BridgeLevel); ok {
+			return name, entry, true
+		}
+	}
+	return "", toolBridgeEntry{}, false
 }
 
 // nativeToolNameList 返回稳定的原生工具名列表（用于错误信息与文档一致性）。
@@ -1337,10 +1403,14 @@ func (ps *ProxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Requ
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "invalid_json", "Invalid request: %v", err)
 		return
 	}
-	policy, code, err := normalizeToolPolicy(&req, ps.config.ToolsMode)
+	policy, code, err := normalizeToolPolicy(&req, ps.config.ToolsMode, ps.config.Bridge)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", code, "%v", err)
 		return
+	}
+	if len(policy.Bridged) > 0 {
+		// 告诉调用方"你的工具被桥接到上游了"，以及用的是哪一档。
+		w.Header().Set("X-OrcaTerm-Bridge", policy.BridgeLevel)
 	}
 	if len(policy.Unsupported) > 0 {
 		// 这些工具上游没有，永远不会被调用。用响应头 + 日志暴露，
@@ -1364,14 +1434,16 @@ func (ps *ProxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Requ
 	if key == "" {
 		key = req.SessionID
 	}
-	// 先解析尾部工具结果，并判断它到底是不是"我方 OrcaTerm 工具"的结果：
-	// agent 客户端会回放自己工具（Agent / Bash…）的结果，那是本轮输入，不是待回填调用。
+	// 先解析尾部工具结果。它到底是"我方 OrcaTerm 工具的待回填结果"还是
+	// "客户端自己工具的执行结果"，**优先按 tool_call_id 判定**：我方发出的调用 id
+	// 一定能在 store 里取到，客户端自己工具的 id 取不到。
+	// 桥接之后这条判定尤其关键 —— 对外发的名字已经是客户端名（Bash），
+	// 按名字判断会把桥接调用误判成"客户端自己的工具"从而拒绝回填。
 	toolResults, hasToolResult, err := trailingToolResults(req.Messages)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", inputPlanErrorCode(err), "%v", err)
 		return
 	}
-	ourToolResult := hasToolResult && !HasForeignToolResult(toolResults)
 	var lease *Lease
 	var plan *InputPlan
 	committed := false
@@ -1380,41 +1452,64 @@ func (ps *ProxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Requ
 			_ = lease.Rollback()
 		}
 	}()
+	ourToolResult := false
+	var pending PendingCall
+	switch {
+	case hasToolResult && len(toolResults) > 1 && !HasForeignToolResult(toolResults):
+		// 上游一次只维护一个待处理调用，多个我方结果无法确定回填哪一个；
+		// 先于任何 store 操作拒绝。
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "multiple_tool_results_unsupported",
+			"%d OrcaTerm tool results in one request; the upstream handles one pending call at a time", len(toolResults))
+		return
+	case hasToolResult && len(toolResults) == 1 && !toolResults[0].Legacy:
+		// 有 id：能否取到就是归属判定的依据。取不到（unknown_call）说明这是
+		// 客户端自己工具的 id —— 那不是错误，按本轮输入处理。
+		l, p, aerr := ps.sessions.AcquireCall(r.Context(), toolResults[0].ToolCallID, key)
+		switch {
+		case aerr == nil:
+			lease, pending, ourToolResult = l, p, true
+		case !IsStoreError(aerr, StoreErrorUnknownCall):
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", storeErrorCode(aerr), "%v", aerr)
+			return
+		case !HasForeignToolResult(toolResults):
+			// id 查不到，但工具名是 OrcaTerm 原生名（或干脆没写名字）：
+			// 说明调用方在回填一个我方从未发出过的调用。这是错误，不能静默当成
+			// 客户端自己的工具结果 —— 否则伪造的"工具结果"会被当成用户输入。
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", storeErrorCode(aerr), "%v", aerr)
+			return
+		}
+		// 剩下的情况：id 陌生 + 名字是外来工具名 = 客户端自己工具的回放，按本轮输入处理。
+	case hasToolResult && len(toolResults) == 1 && toolResults[0].Legacy && !HasForeignToolResult(toolResults):
+		// legacy（role=function）没有 id 可查，只能沿用按工具名判断的老语义。
+		if key == "" {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "legacy_function_result_requires_session",
+				"legacy role=\"function\" results carry no tool_call_id; reuse the X-Session-Id or user of the triggering request")
+			return
+		}
+		unique, uerr := ps.sessions.UniquePendingCall(key)
+		if uerr != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", storeErrorCode(uerr), "%v", uerr)
+			return
+		}
+		toolResults[0].ToolCallID = unique.ID
+		l, p, aerr := ps.sessions.AcquireCall(r.Context(), unique.ID, key)
+		if aerr != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", storeErrorCode(aerr), "%v", aerr)
+			return
+		}
+		lease, pending, ourToolResult = l, p, true
+	}
 	if ourToolResult {
-		// 上游一次只维护一个待处理调用，多个结果无法确定回填哪一个；先于任何 store 操作拒绝。
-		if len(toolResults) != 1 {
-			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "multiple_tool_results_unsupported",
-				"%d OrcaTerm tool results in one request; the upstream handles one pending call at a time", len(toolResults))
-			return
-		}
 		result := toolResults[0]
-		var pending PendingCall
-		if result.Legacy {
-			if key == "" {
-				writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "legacy_function_result_requires_session",
-					"legacy role=\"function\" results carry no tool_call_id; reuse the X-Session-Id or user of the triggering request")
-				return
-			}
-			pending, err = ps.sessions.UniquePendingCall(key)
-			if err != nil {
-				writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", storeErrorCode(err), "%v", err)
-				return
-			}
-			result.ToolCallID = pending.ID
-		}
-		lease, pending, err = ps.sessions.AcquireCall(r.Context(), result.ToolCallID, key)
-		if err != nil {
-			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", storeErrorCode(err), "%v", err)
-			return
-		}
-		// 上游一次只维护一个待处理调用，多个结果无法确定回填哪一个。
+		// 上游一次只维护一个待处理调用，名字对不上说明调用方回错了结果。
 		if name := strings.TrimSpace(result.Name); name != "" && name != pending.Name {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "tool_result_name_mismatch",
 				"tool result name %q does not match pending tool %q", name, pending.Name)
 			return
 		}
 		plan = &InputPlan{
-			Text:         BuildToolResultPrompt(pending.Name, result.Content),
+			// 桥接时 pending.Name 是客户端名，回填上游必须用原生名。
+			Text:         BuildToolResultPrompt(pending.UpstreamName(), result.Content),
 			IsToolResult: true,
 			Results: []ToolResultMessage{{
 				ToolCallID: pending.ID, Name: pending.Name, Content: result.Content, Legacy: result.Legacy,
@@ -1431,15 +1526,17 @@ func (ps *ProxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Requ
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", sessionAcquireErrorCode(err), "%v", err)
 			return
 		}
+		// lease.Session 是拿到同一 CID 租约之后取得的快照，因此并发请求看到的也是
+		// 串行化之后的轮次：新建会话或上游尚无历史轮次时都按首轮处理，
+		// 必须发送完整 system + 初始历史。
+		multiTurn := key != "" && lease.Session.Turns > 0
 		switch {
 		case hasToolResult:
 			// 调用方自己工具的结果：当成本轮输入交给上游，输出不丢，也不去碰 pending call。
-			plan = &InputPlan{Text: RenderClientToolResults(toolResults), Results: toolResults}
+			// 必须把用户原本的问题一起带上 —— 只发一段工具输出会让上游失去上下文，
+			// 很容易自己"想起"要用工具，进而撞上 undeclared tool 的 502。
+			plan = &InputPlan{Text: clientToolResultInput(req.Messages, multiTurn, toolResults), Results: toolResults}
 		default:
-			// lease.Session 是拿到同一 CID 租约之后取得的快照，因此并发请求看到的也是
-			// 串行化之后的轮次：新建会话或上游尚无历史轮次时都按首轮处理，
-			// 必须发送完整 system + 初始历史。
-			multiTurn := key != "" && lease.Session.Turns > 0
 			plan, err = extractInputPlan(req.Messages, multiTurn)
 			if err != nil {
 				writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", inputPlanErrorCode(err), "%v", err)
@@ -1478,12 +1575,25 @@ func (ps *ProxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Requ
 	}
 	text, action := outcome.Text, outcome.Action
 	toolCalls := outcome.ToolCalls()
+	// bridgedNative 记录本轮是否做过桥接改名：非空表示对外发出的是客户端名，
+	// 而回填上游时要用这个原生名。
+	bridgedNative := ""
 	if len(toolCalls) > 0 {
-		// 上游调用了调用方没有声明的工具：明确报错，并且不创建 pending call。
-		if !declaresTool(policy.Tools, toolCalls[0].Function.Name) {
-			writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream_requested_undeclared_tool",
-				"upstream requested undeclared tool %q; declare it in tools/functions or remove the tool schema", toolCalls[0].Function.Name)
-			return
+		native := toolCalls[0].Function.Name
+		// 上游调用了调用方既没声明、也无法桥接的工具：明确报错，并且不创建 pending call。
+		if !declaresTool(policy.Tools, native) {
+			if _, _, ok := policy.bridgeClientFor(native); !ok {
+				writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream_requested_undeclared_tool",
+					"upstream requested undeclared tool %q; declare it in tools/functions, declare a client tool that bridges to it, or remove the tool schema", native)
+				return
+			}
+		}
+		// 桥接：把上游原生调用改名成客户端声明的工具，并重映射参数。
+		if client, entry, ok := policy.bridgeClientFor(native); ok {
+			toolCalls[0].Function.Name = client
+			toolCalls[0].Function.Arguments = RemapBridgeArgs(toolCalls[0].Function.Arguments, entry)
+			bridgedNative = native
+			log.Printf("[INFO] 工具桥接：上游 %s -> 调用方 %s", native, client)
 		}
 		text = ""
 	}
@@ -1513,7 +1623,14 @@ func (ps *ProxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Requ
 	usage := map[string]interface{}{"prompt_tokens": promptTokens, "completion_tokens": completionTokens, "total_tokens": total, "estimated": true}
 	var nextPending *PendingCall
 	if len(toolCalls) > 0 {
-		nextPending = &PendingCall{ID: toolCalls[0].ID, Name: toolCalls[0].Function.Name, Arguments: toolCalls[0].Function.Arguments}
+		// Name 是发给调用方的名字（桥接后是客户端名），NativeName 是上游原名，
+		// 结果回填时用 UpstreamName() 取后者。
+		nextPending = &PendingCall{
+			ID:         toolCalls[0].ID,
+			Name:       toolCalls[0].Function.Name,
+			NativeName: bridgedNative,
+			Arguments:  toolCalls[0].Function.Arguments,
+		}
 	}
 	if err := lease.Commit(1, total, nextPending); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "api_error", "session_commit_failed", "%v", err)
@@ -1973,7 +2090,7 @@ const corsAllowedHeaders = "Content-Type, Authorization, X-Session-Id, OpenAI-Or
 const corsExposedHeaders = "X-OrcaTerm-Action, X-OrcaTerm-Degraded, X-OrcaTerm-Session, X-OrcaTerm-Turn, " +
 	"X-OrcaTerm-Context-Used, X-OrcaTerm-Context-Limit, X-OrcaTerm-Context-Remaining, " +
 	"X-OrcaTerm-Usage-Estimated, X-OrcaTerm-Tool-Result-Turn, X-OrcaTerm-Model, X-OrcaTerm-Model-Id, " +
-	"X-OrcaTerm-Unsupported-Tools"
+	"X-OrcaTerm-Unsupported-Tools, X-OrcaTerm-Bridge"
 
 // corsMiddleware 按 allowlist 处理跨域。
 //

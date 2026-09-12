@@ -24,7 +24,7 @@
 正常日志示例：
 
 ```text
-[INFO] OrcaTerm AI Proxy v0.9.0 starting on http://localhost:8080
+[INFO] OrcaTerm AI Proxy v0.10.0 starting on http://localhost:8080
 [INFO] 凭据: true (sid=true ot=true)
 ```
 
@@ -86,6 +86,28 @@ curl http://localhost:8080/v1/chat/completions `
 
 上游经常先用一句反问确认（"是否按这个思路开始执行？"），此时响应是正常 200、`finish_reason` 为 `stop`，但真实动作记录在响应头 `X-OrcaTerm-Action: ask` 里；agent 客户端应读取该头来区分"最终答案"与"反问"。详见分析报告 §3.3。
 
+## 工具桥接（给 agent 客户端用）
+
+ZCode / Cline / Roo 这类 agent 客户端会声明自己的工具集（`Bash`、`Read`、`WebFetch`…），而上游只认 OrcaTerm 的原生工具名（`execute_command`、`remote_read`、`fetch`…）。两边的**名字和参数 schema 都不同**，上游又注册不了自定义 function，所以代理在中间做一层改名 + 参数重映射：
+
+```
+声明：  客户端声明 Bash                     → 代理认为可以承接 execute_command
+调用：  上游下发 execute_command{command}   → 代理发出 Bash{command}
+回填：  客户端回传 Bash 的结果              → 代理以 execute_command 的名义回填上游
+```
+
+参数形状来自真机采样（`tools/reverse/tool_arg_sample.py`）。映射表在 `content.go` 的 `clientToolBridge`，分两档：
+
+| `ORCATERM_TOOLS_BRIDGE` | 桥接范围 |
+|---|---|
+| `off` | 不桥接，外来工具只被记为 Unsupported |
+| `safe`（默认） | `Bash` ↔ `execute_command`、`WebFetch` ↔ `fetch` |
+| `all` | 再加 `Read` ↔ `remote_read`、`Write` ↔ `remote_write`、`Grep` ↔ `remote_grep` |
+
+**`all` 档要谨慎**：上游这几个工具的官方描述里写的是"远程服务器"，它们作用于 **OrcaTerm 连接的远端主机**，并不等于调用方本地文件系统。把它们桥接到本地的 `Read`/`Write` 会让工具"动起来"，但执行位置与调用方的直觉不同，`Write` 更是写操作。默认只开 `safe` 就是这个原因。
+
+桥接生效时响应会带 `X-OrcaTerm-Bridge: safe|all`；映射表里没有的工具（`Agent`、`TodoWrite` 等）在上游没有对应物，永远不会被调用，仍走 `X-OrcaTerm-Unsupported-Tools` 告知。
+
 ## 登录态
 
 代理读取本机 OrcaTerm 的 `.cookies`，登录态过期后上游会返回 HTTP 200 加 `code=10050000`，代理会把它归类为 502 `upstream_auth_error` 并提示重新登录。`GET /health` 会附带 `token_expires_at` 与 `token_expired`，可在请求失败前发现需要刷新登录；上游没有刷新接口，代理无法自行续期。
@@ -120,6 +142,7 @@ $env:ORCATERM_CORS_ORIGINS="http://localhost:3000,https://app.example.com"
 | `ORCATERM_MODE` | `structured` | `structured` / `raw-stream`；两者均先完整解析 |
 | `ORCATERM_ON_DEGRADED` | `empty` | `empty` / `raw` / `error` |
 | `ORCATERM_TOOLS_MODE` | `pass` | `pass` / `native` / `ignore` / `error`；`inject` 仅为 legacy 模拟且不可靠。见分析报告 §4.4 |
+| `ORCATERM_TOOLS_BRIDGE` | `safe` | `off` / `safe` / `all`，见下方"工具桥接" |
 | `ORCATERM_HIDE_TOOLS` | `1` | `1` 要求上游隐藏内部工具消息；`0` 关闭 HideTools |
 | `ORCATERM_STRIP_PERSONA` | `1` | `0` / `1`，清洗兜底 |
 | `ORCATERM_SESSION_TTL` | `30m` | Go duration，如 `10m`、`1h` |

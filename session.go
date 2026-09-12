@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -31,13 +32,27 @@ const (
 
 // PendingCall contains everything needed to route a later tool result.
 type PendingCall struct {
-	ID         string
-	Name       string
+	ID   string
+	Name string
+	// NativeName 是这条调用在**上游**那侧的名字。未桥接时等于 Name；
+	// 桥接时 Name 是发给客户端的名字（如 Bash），NativeName 是上游原名
+	// （如 execute_command）—— 回填结果必须以原生名的名义送回上游。
+	NativeName string
 	Arguments  string
 	CID        string
 	SessionKey string
 	CreatedAt  time.Time
 	State      CallState
+}
+
+// UpstreamName 返回把结果回填给上游时应当使用的工具名。
+// 桥接时对外发的是客户端名（Bash），但上游只认自己的原生名（execute_command），
+// 所以回填一律用 NativeName；未桥接时 NativeName 为空，退回 Name。
+func (p PendingCall) UpstreamName() string {
+	if strings.TrimSpace(p.NativeName) != "" {
+		return p.NativeName
+	}
+	return p.Name
 }
 
 type StoreErrorKind string

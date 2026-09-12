@@ -162,7 +162,7 @@ func TestNativeToolAllowlistCoversTerminalChain(t *testing.T) {
 		declared = append(declared, Tool{Type: "function", Function: ToolFunction{Name: name}})
 	}
 	req := ChatCompletionRequest{Tools: declared}
-	policy, code, err := normalizeToolPolicy(&req, "native")
+	policy, code, err := normalizeToolPolicy(&req, "native", bridgeOff)
 	if err != nil {
 		t.Fatalf("终端工具链应被接受: code=%q err=%v", code, err)
 	}
@@ -171,7 +171,7 @@ func TestNativeToolAllowlistCoversTerminalChain(t *testing.T) {
 	}
 	// 表外名字仍然被拒
 	bad := ChatCompletionRequest{Tools: []Tool{{Type: "function", Function: ToolFunction{Name: "my_custom_fn"}}}}
-	if _, code, err := normalizeToolPolicy(&bad, "native"); err == nil || code != "custom_tools_unsupported" {
+	if _, code, err := normalizeToolPolicy(&bad, "native", bridgeOff); err == nil || code != "custom_tools_unsupported" {
 		t.Fatalf("表外工具应被拒绝: code=%q err=%v", code, err)
 	}
 }

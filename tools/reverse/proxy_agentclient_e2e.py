@@ -71,6 +71,9 @@ def answer_of(body):
 
 # ZCode 实测形状：自己的工具集 + hy4-preview
 FOREIGN = ["Agent", "Bash", "Read", "Write", "Edit", "Glob", "Grep"]
+# Bash 在默认桥接档（safe）下会被桥接到上游 execute_command，
+# 因此它**不再**出现在 Unsupported 里 —— 这正是桥接生效的标志。
+FOREIGN_UNSUPPORTED = [n for n in FOREIGN if n != "Bash"]
 MODEL = "hy4-preview"
 
 print("=== 1. agent 客户端只声明自己的工具（ZCode 形状）===")
@@ -81,8 +84,11 @@ status, hdrs, body = post({
 })
 check("状态 200（不再 400 custom_tools_unsupported）", status == 200,
       f"status={status} " + json.dumps(body, ensure_ascii=False)[:200])
-check("X-OrcaTerm-Unsupported-Tools 如实列出",
-      hdrs.get("X-OrcaTerm-Unsupported-Tools") == ",".join(FOREIGN),
+check("X-OrcaTerm-Unsupported-Tools 如实列出（Bash 已被桥接，不在其中）",
+      hdrs.get("X-OrcaTerm-Unsupported-Tools") == ",".join(FOREIGN_UNSUPPORTED),
+      hdrs.get("X-OrcaTerm-Unsupported-Tools"))
+check("Bash 不再被当成 Unsupported（桥接生效）",
+      "Bash" not in (hdrs.get("X-OrcaTerm-Unsupported-Tools") or ""),
       hdrs.get("X-OrcaTerm-Unsupported-Tools"))
 check("返回可读正文", bool(answer_of(body).strip()),
       (answer_of(body) or json.dumps(body, ensure_ascii=False))[:200])
@@ -98,8 +104,8 @@ status, hdrs, body = post({
     "tools": [tool("fetch", "抓取网页")] + [tool(n) for n in FOREIGN],
 })
 check("状态 200", status == 200, f"status={status}")
-check("外来名仍然暴露",
-      hdrs.get("X-OrcaTerm-Unsupported-Tools") == ",".join(FOREIGN),
+check("外来名仍然暴露（Bash 已被桥接，不在其中）",
+      hdrs.get("X-OrcaTerm-Unsupported-Tools") == ",".join(FOREIGN_UNSUPPORTED),
       hdrs.get("X-OrcaTerm-Unsupported-Tools"))
 calls = ((body.get("choices") or [{}])[0].get("message") or {}).get("tool_calls") or []
 if calls:
@@ -151,6 +157,51 @@ check("状态 200", status == 200, f"status={status} " + json.dumps(
 
 print("\n=== 5. 严格模式仍是可选项 ===")
 print("    设 ORCATERM_TOOLS_MODE=native 时，表外名字才会 400 custom_tools_unsupported")
+
+print("\n=== 6. 工具桥接：只声明 Bash，上游的 execute_command 应改名成 Bash ===")
+print("    （默认 ORCATERM_TOOLS_BRIDGE=safe）")
+status, hdrs, body = post({
+    "model": MODEL,
+    "messages": [{"role": "user", "content": "请执行命令 uname -a"}],
+    "tools": [tool("Bash", "Run a shell command")],
+})
+check("状态 200", status == 200,
+      f"status={status} " + json.dumps(body.get("error", {}), ensure_ascii=False)[:200])
+calls6 = ((body.get("choices") or [{}])[0].get("message") or {}).get("tool_calls") or []
+bridge_call = None
+if calls6:
+    bridge_call = calls6[0]
+    check("对外名字是客户端声明的 Bash", calls6[0]["function"]["name"] == "Bash",
+          calls6[0]["function"]["name"])
+    args6 = json.loads(calls6[0]["function"]["arguments"] or "{}")
+    check("参数重映射后仍带 command", "command" in args6, json.dumps(args6, ensure_ascii=False))
+    check("上游专有参数被丢弃",
+          not ({"terminal_id", "connect_config_id"} & set(args6)),
+          json.dumps(args6, ensure_ascii=False))
+    check("响应头标出桥接档位", hdrs.get("X-OrcaTerm-Bridge") == "safe",
+          hdrs.get("X-OrcaTerm-Bridge"))
+else:
+    info("本轮模型未发起工具调用（模型行为，不算失败）", answer_of(body)[:150])
+
+print("\n=== 7. 桥接调用的结果能被回传（按 id 认领，不再 400）===")
+if bridge_call is None:
+    info("第 6 例没拿到工具调用，跳过回传验证")
+else:
+    status, hdrs, body = post({
+        "model": MODEL,
+        "messages": [
+            {"role": "user", "content": "请执行命令 uname -a"},
+            {"role": "assistant", "content": None, "tool_calls": [bridge_call]},
+            {"role": "tool", "tool_call_id": bridge_call["id"], "name": "Bash",
+             "content": "MARKER-BRIDGE-1 Linux orcabridge 6.6.0"},
+        ],
+        "tools": [tool("Bash", "Run a shell command")],
+    })
+    check("回传桥接结果 200（不再 400 unknown_tool_call_id）", status == 200,
+          f"status={status} " + json.dumps(body.get("error", {}), ensure_ascii=False)[:200])
+    check("模型消费了桥接结果",
+          "MARKER-BRIDGE-1" in answer_of(body) or "Linux" in answer_of(body),
+          answer_of(body)[:200])
 
 print()
 if failures:

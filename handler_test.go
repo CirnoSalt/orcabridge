@@ -591,10 +591,12 @@ func TestNormalizeToolPolicy(t *testing.T) {
 		name       string
 		req        ChatCompletionRequest
 		mode       string
+		bridge     string // 空视为 off，保持本表原有语义
 		wantCode   string
 		wantDial   string
 		wantChoice string
 		wantEnable bool
+		wantBridge map[string]string // 期望的 Bridged（客户端名 -> 原生名）
 	}{
 		{name: "no tools", req: ChatCompletionRequest{}, mode: "native", wantChoice: "auto"},
 		{name: "modern auto", req: ChatCompletionRequest{Tools: nativeDecl}, mode: "native",
@@ -631,12 +633,41 @@ func TestNormalizeToolPolicy(t *testing.T) {
 		{name: "mode error", req: ChatCompletionRequest{Tools: nativeDecl}, mode: "error", wantCode: "tools_unsupported"},
 		{name: "mode ignore", req: ChatCompletionRequest{Tools: nativeDecl}, mode: "ignore",
 			wantDial: "modern", wantChoice: "auto"},
+		// ---- 工具桥接 ----
+		// 只声明 Bash：桥接开启后应能承接 execute_command，因此启用上游工具服务。
+		{name: "bridge bash", mode: "pass", bridge: "safe",
+			req:      ChatCompletionRequest{Tools: []Tool{{Type: "function", Function: ToolFunction{Name: "Bash"}}}},
+			wantDial: "modern", wantChoice: "auto", wantEnable: true,
+			wantBridge: map[string]string{"Bash": "execute_command"}},
+		// 桥接关闭时 Bash 只是外来工具，不启用上游服务。
+		{name: "bridge off", mode: "pass", bridge: "off",
+			req:      ChatCompletionRequest{Tools: []Tool{{Type: "function", Function: ToolFunction{Name: "Bash"}}}},
+			wantDial: "modern", wantChoice: "auto", wantEnable: false},
+		// Read 属于 riskRemote，safe 档不桥接，all 档才桥接。
+		{name: "read needs all", mode: "pass", bridge: "safe",
+			req:      ChatCompletionRequest{Tools: []Tool{{Type: "function", Function: ToolFunction{Name: "Read"}}}},
+			wantDial: "modern", wantChoice: "auto", wantEnable: false},
+		{name: "read with all", mode: "pass", bridge: "all",
+			req:      ChatCompletionRequest{Tools: []Tool{{Type: "function", Function: ToolFunction{Name: "Read"}}}},
+			wantDial: "modern", wantChoice: "auto", wantEnable: true,
+			wantBridge: map[string]string{"Read": "remote_read"}},
+		// 原生名被直接声明时按原生透传，不再改名。
+		{name: "native declared wins", mode: "pass", bridge: "safe",
+			req: ChatCompletionRequest{Tools: []Tool{
+				{Type: "function", Function: ToolFunction{Name: "Bash"}},
+				{Type: "function", Function: ToolFunction{Name: "execute_command"}},
+			}},
+			wantDial: "modern", wantChoice: "auto", wantEnable: true},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			req := c.req
-			policy, code, err := normalizeToolPolicy(&req, c.mode)
+			level := c.bridge
+			if level == "" {
+				level = bridgeOff
+			}
+			policy, code, err := normalizeToolPolicy(&req, c.mode, level)
 			if c.wantCode != "" {
 				if err == nil || code != c.wantCode {
 					t.Fatalf("期望错误码 %q，实际 code=%q err=%v", c.wantCode, code, err)
@@ -657,6 +688,16 @@ func TestNormalizeToolPolicy(t *testing.T) {
 			}
 			if policy.Mode != c.mode {
 				t.Errorf("mode = %q，期望 %q", policy.Mode, c.mode)
+			}
+			if c.wantBridge != nil {
+				if len(policy.Bridged) != len(c.wantBridge) {
+					t.Fatalf("Bridged = %v，期望 %v", policy.Bridged, c.wantBridge)
+				}
+				for client, nativeName := range c.wantBridge {
+					if policy.Bridged[client] != nativeName {
+						t.Errorf("Bridged[%q] = %q，期望 %q", client, policy.Bridged[client], nativeName)
+					}
+				}
 			}
 		})
 	}

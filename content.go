@@ -712,6 +712,134 @@ func RenderClientToolResults(results []ToolResultMessage) string {
 	return strings.TrimSpace(sb.String())
 }
 
+// ===== 工具桥接：客户端声明的工具 ↔ OrcaTerm 原生工具 =====
+//
+// 背景：agent 客户端（ZCode / Cline / Roo）会声明自己的工具集（Bash / Read / …），
+// 而上游只认 OrcaTerm 原生工具名（execute_command / remote_read / …）。
+// 两者的**名字和参数 schema 都不同**，且上游注册不了自定义 function，
+// 所以只能由代理在中间做一层改名 + 参数重映射：
+//
+//   上行（声明）：客户端声明 Bash  ->  代理认为可以承接 execute_command
+//   下行（调用）：上游下发 execute_command{command}  ->  代理发出 Bash{command}
+//   回填（结果）：客户端回传 Bash 的结果  ->  代理按 execute_command 的名义回填上游
+//
+// 参数形状来源：tools/reverse/tool_arg_sample.py 真机采样（2026-09-12）。
+// 上游的 tool schema 由服务端下发，客户端 bundle 里只有名字，只能靠采样。
+
+// bridgeRisk 标记一条映射的语义风险等级。
+type bridgeRisk string
+
+const (
+	// riskSafe 表示两侧语义等价，改名即可。
+	riskSafe bridgeRisk = "safe"
+	// riskRemote 表示上游这一侧作用于 **OrcaTerm 连接的远端主机**，
+	// 而不是调用方本地（上游自己的描述里就写着"远程服务器"）。
+	// 桥接它能让工具"动起来"，但执行位置与调用方的直觉不同，必须显式开启。
+	riskRemote bridgeRisk = "remote"
+)
+
+// toolBridgeEntry 是一条"客户端工具 -> OrcaTerm 原生工具"的映射。
+type toolBridgeEntry struct {
+	Native string            // 对应的 OrcaTerm 原生工具名
+	Args   map[string]string // 上游参数名 -> 客户端参数名；未列出的上游参数一律丢弃
+	Risk   bridgeRisk
+}
+
+// clientToolBridge 是可桥接的客户端工具表。
+//
+// 未列入的工具（Agent / TodoWrite / NotebookEdit …）在上游没有对应物，
+// 永远不会被调用，只能走 X-OrcaTerm-Unsupported-Tools 告知。
+// remote_glob / remote_edit 的参数形状本轮没采样成功（上游会先要 list_terminals
+// 而 502），**没有实测就不写进表**，避免拿猜测的 schema 去驱动客户端。
+var clientToolBridge = map[string]toolBridgeEntry{
+	"Bash": {
+		Native: "execute_command",
+		Args:   map[string]string{"command": "command"},
+		Risk:   riskSafe,
+	},
+	"WebFetch": {
+		Native: "fetch",
+		Args:   map[string]string{"url": "url"},
+		Risk:   riskSafe,
+	},
+	"Read": {
+		Native: "remote_read",
+		Args:   map[string]string{"file_path": "file_path"},
+		Risk:   riskRemote,
+	},
+	"Write": {
+		Native: "remote_write",
+		Args:   map[string]string{"file_path": "file_path", "content": "content"},
+		Risk:   riskRemote,
+	},
+	"Grep": {
+		Native: "remote_grep",
+		Args:   map[string]string{"pattern": "pattern", "path": "path"},
+		Risk:   riskRemote,
+	},
+}
+
+// bridgeAllows 判断给定的桥接级别是否允许这一风险等级。
+// off：不桥接；safe：只做语义等价的；all：连同远端文件操作一起。
+func bridgeAllows(level string, risk bridgeRisk) bool {
+	switch level {
+	case "all":
+		return true
+	case "safe":
+		return risk == riskSafe
+	default:
+		return false
+	}
+}
+
+// BridgeEntryFor 返回客户端工具名在给定桥接级别下的映射。
+func BridgeEntryFor(clientName, level string) (toolBridgeEntry, bool) {
+	entry, ok := clientToolBridge[strings.TrimSpace(clientName)]
+	if !ok || !bridgeAllows(level, entry.Risk) {
+		return toolBridgeEntry{}, false
+	}
+	return entry, true
+}
+
+// RemapBridgeArgs 把上游原生参数重映射成客户端工具的参数。
+//
+// 只保留映射表里列出的键，其余（OrcaTerm 专有的 terminal_id / connect_config_id、
+// fetch 的 requestMode 等）一律丢弃 —— 客户端不认识这些键，带过去只会让它报 schema 错误。
+// 参数解析失败时退化成 "{}"，让客户端自己报参数错误，而不是让代理替它编造。
+func RemapBridgeArgs(rawArgs string, entry toolBridgeEntry) string {
+	out := map[string]json.RawMessage{}
+	var upstream map[string]json.RawMessage
+	if s := strings.TrimSpace(rawArgs); s != "" && s != "null" {
+		if err := json.Unmarshal([]byte(s), &upstream); err != nil {
+			return "{}"
+		}
+	}
+	for from, to := range entry.Args {
+		if value, ok := upstream[from]; ok {
+			out[to] = value
+		}
+	}
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		return "{}"
+	}
+	return string(encoded)
+}
+
+// clientToolResultInput 把"客户端自己工具的结果"渲染成本轮输入，并保留用户原本的问题。
+//
+// 只发工具输出是不够的：上游会看到一段没有上下文的输出，很容易自己"想起"要用工具，
+// 而我们并没有为它声明任何工具，于是变成 502 upstream_requested_undeclared_tool。
+// 多轮会话里用户的问题已经在上游历史中，是否重发由 multiTurn 决定（与正常轮次一致）。
+func clientToolResultInput(msgs []ChatMessage, multiTurn bool, results []ToolResultMessage) string {
+	rendered := RenderClientToolResults(results)
+	text, _, err := extractInput(msgs, multiTurn)
+	if err != nil || strings.TrimSpace(text) == "" {
+		return rendered
+	}
+	return text + "\n\n" + rendered
+}
+
 // ExtractToolCalls 从模型输出中解析专用的 ```tool_calls 围栏。
 // 只有成功解析的专用围栏会从正文剥离，普通 Markdown/JSON 围栏一律保留。
 func ExtractToolCalls(text string) ([]ToolCall, string) {

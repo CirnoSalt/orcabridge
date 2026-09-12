@@ -1,6 +1,6 @@
 # OrcaBridge：OrcaTerm AI 协议与兼容性分析
 
-> 版本：v0.9.0
+> 版本：v0.10.0
 > 更新：2026-09-12
 > 范围：本修复版本的已实现行为
 
@@ -197,8 +197,59 @@ legacy `role:"function"` 结果不含 `tool_call_id`，仅靠消息无法可靠�
 调用方不会误以为自己的工具已经生效。
 
 客户端回放**自己**工具的结果（`role:"tool"`，id 不是代理发过的）不会被当成待回填调用，
-而是作为本轮输入送进上游，`content` 不会丢；代理只在工具名为原生工具时才去匹配待处理调用。
+而是作为本轮输入送进上游（连用户原本的问题一起带上，只发工具输出会让上游失去上下文），
+`content` 不会丢。归属判定**优先看 `tool_call_id` 能否在会话表里取到待处理调用**，
+取不到时才回退到按工具名判断：名字是原生名（或没写名字）说明调用方在回填一个我方从未
+发出过的调用，报 400 `unknown_tool_call_id`；名字是外来工具名才当作客户端自己的工具。
+先看 id 是必须的 —— 桥接之后对外发的名字本来就是客户端名（§4.7），按名字判断会误判。
 多个客户端工具结果也允许（"一次只能一个"的限制只针对原生工具）。
+
+### 4.7 客户端工具桥接（语义映射）
+
+`pass` 模式让 agent 客户端不再被 400，但它声明的 `Bash` / `Read` 依然"永远不会被调用"——
+上游只认自己的原生工具名。**两者的名字和参数 schema 都不同**，且自定义 function 注册不了
+（§4.3），所以只能由代理在中间做一层改名 + 参数重映射：
+
+| 方向 | 动作 |
+|---|---|
+| 声明 | 客户端声明 `Bash` → 代理认为可以承接 `execute_command`，据此启用上游工具服务 |
+| 调用 | 上游下发 `execute_command{command}` → 代理发出 `Bash{command}` |
+| 回填 | 客户端回传 `Bash` 的结果 → 代理以 `execute_command` 的名义回填上游 |
+
+关键点：**`chatBody` 并不向上游发送工具名**，只按 `policy.Enabled` 开关
+`mcp-server-orcaterm-oauth` / `ui-tools-orcaterm-explorer` 两个服务器；调用方声明的
+`tools` 只是代理侧的放行白名单。所以"能不能承接"决定了要不要开启上游工具服务，
+而桥接映射让客户端工具也能计入这一判断。
+
+参数形状取自真机采样（`tools/reverse/tool_arg_sample.py`，2026-09-12）：
+
+```jsonc
+{"name":"execute_command","type":"mcp","mcpServer":"mcp-server-orcaterm-oauth",
+ "args":{"command":"uname -a"}}
+{"name":"fetch","type":"mcp","mcpServer":"mcp-server-web-fetch",
+ "args":{"url":"https://example.com","requestMode":"user_specified"}}
+{"name":"remote_read","type":"ui",
+ "args":{"file_path":"/etc/hostname","terminal_id":"","connect_config_id":""}}
+{"name":"remote_grep","type":"ui",
+ "args":{"pattern":"error","path":"/var/log","terminal_id":"","connect_config_id":""}}
+{"name":"remote_write","type":"ui",
+ "args":{"file_path":"/tmp/a.txt","content":"hello","terminal_id":"","connect_config_id":""}}
+```
+
+映射表（`content.go` 的 `clientToolBridge`）按**语义风险**分档，`ORCATERM_TOOLS_BRIDGE`
+控制开到哪一档：`safe`（默认）只做语义等价的 `Bash`↔`execute_command`、
+`WebFetch`↔`fetch`；`all` 再加文件/搜索类。
+
+> **为什么文件类默认是关的**：上游这几个工具的官方描述里写的是"远程服务器"，
+> 它们作用于 **OrcaTerm 连接的远端主机**，不等于调用方本地文件系统。把它们桥接到
+> 本地的 `Read`/`Write` 能让工具"动起来"，但执行位置与调用方直觉不同，`Write` 更是写操作。
+> 另外它们属于 `type=ui`，args 里带 `terminal_id` / `connect_config_id`，重映射时会被丢弃。
+
+`remote_glob` / `remote_edit` 的参数形状本轮没采样成功（上游会先要 `list_terminals` 而
+502），**没有实测就不写进表**，避免拿猜测的 schema 去驱动客户端。`Agent` / `TodoWrite`
+这类在上游没有对应物，只能走 `X-OrcaTerm-Unsupported-Tools` 告知。
+
+桥接生效时响应带 `X-OrcaTerm-Bridge: safe|all`。
 
 ### 4.5 上游请求了未声明的工具
 
@@ -245,6 +296,7 @@ OrcaTerm 登录态已失效，请在 OrcaTerm 客户端重新登录后重试
 | `ORCATERM_MODE` | `structured` | `structured` / `raw-stream` |
 | `ORCATERM_ON_DEGRADED` | `empty` | `empty` / `raw` / `error` |
 | `ORCATERM_TOOLS_MODE` | `pass` | `pass` / `native` / `ignore` / `error`；`inject` 为 legacy、不可靠。见 §4.4 |
+| `ORCATERM_TOOLS_BRIDGE` | `safe` | `off` / `safe` / `all`。见 §4.7 |
 | `ORCATERM_HIDE_TOOLS` | `1` | `1` 开启 HideTools，`0` 关闭 |
 | `ORCATERM_STRIP_PERSONA` | `1` | `0` / `1` |
 | `ORCATERM_ALLOW_UNKNOWN_MODEL` | `0` | `0` / `1` |
